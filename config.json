@@ -1,0 +1,32 @@
+{
+  "round_origin": 1,
+  "enable_llm": true,
+  "enable_treasure": true,
+  "return_margin": 4,
+  "vision_range": 4,
+  "economy": {
+    "opening_cash_reserve": 0,
+    "sell_value_threshold": 40,
+    "sell_open_day": 2,
+    "stone_batch": 12,
+    "consumable_start_round": 391
+  },
+  "construction": {
+    "mode": "auto",
+    "wall_target": 12,
+    "adaptive_weapons": false,
+    "weapon_plan": [
+      "rocket",
+      "rocket",
+      "rocket"
+    ]
+  },
+  "tasks": {
+    "solve_estimate": 6
+  },
+  "offense": {
+    "enabled": true,
+    "start_day": 8,
+    "enemy_base_health_threshold": 900
+  }
+}
