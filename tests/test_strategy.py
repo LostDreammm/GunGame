@@ -8,8 +8,8 @@ from agent.brain import (BASE_LOW_HEALTH_RATIO, Strategy, WALL_REPAIR_KIT,
                          wall_stone_deficit)
 from agent.grid import (ROCKET_TURRET_COUNT, TARGET_WALL_COUNT, World,
                         _cluster_connected, base_region, building_rings,
-                        generate_rocket_positions, generate_wall_positions,
-                        template_wall_cells)
+                        cluster_is_operable, generate_rocket_positions,
+                        generate_wall_positions, template_wall_cells)
 
 
 MAP_W, MAP_H = 41, 32
@@ -132,6 +132,7 @@ class LayoutTests(unittest.TestCase):
         self.assertTrue(all(x >= TOP_LEFT_BASE[0] + 1 for x, y in cells))
         blue, _ = building_rings(base, MAP_W, MAP_H)
         self.assertTrue(set(cells) <= blue)
+        self.assertTrue(cluster_is_operable(base, cells, MAP_W, MAP_H))
 
     def test_bottom_right_rockets_are_mirrored_on_the_left(self):
         base = station(*BOTTOM_RIGHT_BASE)
@@ -142,6 +143,7 @@ class LayoutTests(unittest.TestCase):
         self.assertTrue(all(x <= BOTTOM_RIGHT_BASE[0] for x, y in cells))
         top = generate_rocket_positions(station(*TOP_LEFT_BASE), MAP_W, MAP_H)
         self.assertNotEqual(set(cells), set(top))
+        self.assertTrue(cluster_is_operable(base, cells, MAP_W, MAP_H))
 
     def test_both_bases_generate_twelve_unique_walls(self):
         for xy in (TOP_LEFT_BASE, BOTTOM_RIGHT_BASE):
@@ -206,6 +208,30 @@ class NightAndEconomyTests(unittest.TestCase):
             action = commands.get(worker_id, {}).get("action")
             self.assertIn(action, ("collect", "move", "sell", None))
             self.assertNotEqual(action, "attack")
+
+    def test_night_worker_covers_guns_when_pioneer_is_busy(self):
+        sx, sy = TOP_LEFT_BASE
+        rockets = generate_rocket_positions(station(sx, sy), MAP_W, MAP_H)
+        pad_x, pad_y = rockets[0][0] - 1, rockets[0][1]
+        roles = [
+            role(2, 4, 4, "pioneer"),
+            role(3, pad_x, pad_y, "worker"),
+            role(4, 6, 23, "worker"),
+        ]
+        guns = [
+            role(20 + i, x, y, "rocket", attackRange=10, attackPower=20, cooldown=0)
+            for i, (x, y) in enumerate(rockets)
+        ]
+        data = snapshot(roles=roles, night=True, robots=[
+            role(90, rockets[0][0] + 3, rockets[0][1], "smallRobot", health=30),
+        ])
+        data["phaseTask"] = "solve a puzzle"
+        data["teamOur"]["roles"] = [station(sx, sy)] + roles + guns
+        result = Strategy(CONFIG).callback(data)
+        attacks = [cmd for cmd in result["roleCommandMap"].values()
+                   if cmd.get("action") == "attack"]
+        self.assertTrue(attacks)
+        self.assertEqual(str(attacks[0]["controllerId"]), "3")
 
     def test_fixer_restock_stops_at_five(self):
         self.assertEqual(fixer_restock_count(0), 5)
@@ -284,6 +310,27 @@ class NightAndEconomyTests(unittest.TestCase):
         prices = {"stone": 2, "iron": 6, "copper": 8}
         self.assertEqual(preferred_ores(0, prices), ("copper", "iron", "stone"))
         self.assertEqual(preferred_ores(3, prices), ("stone",))
+
+    def test_workers_fill_backpack_before_selling(self):
+        data = snapshot()
+        worker = data["teamOur"]["roles"][2]
+        worker["backpack"] = ["copper"] * 20
+        worker["pos"] = {"x": 4, "y": 24}
+        strategy = bind(Strategy(CONFIG), data)
+        strategy._wall_slots = generate_wall_positions(strategy.w.base, MAP_W, MAP_H)
+        strategy._wall_plan = list(strategy._wall_slots)
+        fake_walls = [role(40 + i, x, y, "wall") for i, (x, y) in enumerate(strategy._wall_slots)]
+        strategy.w.ours.extend(fake_walls)
+        self.assertEqual(strategy._bag_space(worker), 80)
+        self.assertFalse(strategy._sell(worker))
+        self.assertTrue(strategy._mine(worker))
+        action = strategy.commands[str(worker["id"])]["action"]
+        self.assertIn(action, ("collect", "move"))
+        strategy.commands = {}
+        worker["backpack"] = ["copper"] * 100
+        self.assertTrue(strategy._bag_full(worker))
+        self.assertTrue(strategy._sell(worker))
+        self.assertEqual(strategy.commands[str(worker["id"])]["action"], "move")
 
     def test_same_day_sell_only_when_cycle_allows(self):
         self.assertTrue(can_complete_same_day(12, 12))

@@ -10,6 +10,7 @@ settled at turn end, so projected kills never remove ballistic obstructions.
 
 import logging
 from collections import deque
+from itertools import combinations
 
 
 LOG = logging.getLogger(__name__)
@@ -502,30 +503,118 @@ def _cluster_connected(cells):
     return not remaining
 
 
-def _rocket_region_clusters(base, region):
-    """Primary then secondary 3-cell clusters beside the station.
+def _eight_neighbors(cell, width, height):
+    x, y = pos(cell)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx or dy:
+                nxt = (x + dx, y + dy)
+                if _in_bounds(nxt, width, height):
+                    yield nxt
 
-    Offsets are relative to the station top-left cell. Right is +x, up is +y.
+
+def _station_cells(base):
+    return footprint(base) if isinstance(base, dict) and base.get("roleType") == "station" else footprint(
+        {"roleType": "station", "pos": {"x": pos(base)[0], "y": pos(base)[1]}}
+    )
+
+
+def _layout_occupied(base, width, height, extra_blocked, rockets=()):
+    occupied = set(_station_cells(base))
+    occupied.update(pos(cell) for cell in extra_blocked)
+    occupied.update(template_wall_cells(base, width, height))
+    occupied.update(pos(cell) for cell in rockets)
+    return occupied
+
+
+def walkable_operator_pads(gun, occupied, width, height):
+    """Empty 8-neighbour cells a controller can stand on to fire `gun`."""
+    return [cell for cell in _eight_neighbors(gun, width, height) if cell not in occupied]
+
+
+def _bfs_reachable(seeds, occupied, width, height):
+    seen = set()
+    queue = deque()
+    for seed in seeds:
+        cell = pos(seed)
+        if cell in occupied or not _in_bounds(cell, width, height) or cell in seen:
+            continue
+        seen.add(cell)
+        queue.append(cell)
+    while queue:
+        current = queue.popleft()
+        for nxt in _eight_neighbors(current, width, height):
+            if nxt not in occupied and nxt not in seen:
+                seen.add(nxt)
+                queue.append(nxt)
+    return seen
+
+
+def _access_seeds(base, region, occupied, width, height):
+    """Walkable cells on the unwalled side of the C, used as pathfinding starts."""
+    sx, sy = pos(base)
+    if region == BASE_REGION_TOP_LEFT:
+        candidates = [(sx + dx, sy + dy) for dx in range(-4, 0) for dy in range(-5, 5)]
+    else:
+        candidates = [(sx + dx, sy + dy) for dx in range(2, 6) for dy in range(-5, 5)]
+    return [cell for cell in candidates
+            if _in_bounds(cell, width, height) and cell not in occupied]
+
+
+def cluster_is_operable(base, cluster, width, height, extra_blocked=()):
+    """True if each rocket has a reachable standing cell after walls go up."""
+    cluster = [pos(cell) for cell in cluster]
+    if len(cluster) != len(set(cluster)):
+        return False
+    occupied = _layout_occupied(base, width, height, extra_blocked, cluster)
+    pads_by_gun = [walkable_operator_pads(gun, occupied, width, height) for gun in cluster]
+    if any(not pads for pads in pads_by_gun):
+        return False
+    region = base_region(base, width, height)
+    seeds = _access_seeds(base, region, occupied, width, height)
+    if not seeds:
+        seeds = [pad for pads in pads_by_gun for pad in pads]
+    reachable = _bfs_reachable(seeds, occupied, width, height)
+    return all(any(pad in reachable for pad in pads) for pads in pads_by_gun)
+
+
+def _preferred_rocket_clusters(base, region):
+    """Right-column (top-left) / left-column (bottom-right) lines of three.
+
+    These sit on the enemy-facing blue edge but leave the top and bottom
+    corridors along the station free, so a controller can walk in with
+    8-direction movement after the C-shaped wall is up.
     """
     sx, sy = pos(base)
     if region == BASE_REGION_TOP_LEFT:
-        primary = ((sx + 2, sy + 1), (sx + 2, sy), (sx + 1, sy + 1))
-        secondary = ((sx + 2, sy - 1), (sx + 2, sy - 2), (sx + 1, sy - 2))
+        return [
+            ((sx + 2, sy + 1), (sx + 2, sy), (sx + 2, sy - 1)),
+            ((sx + 2, sy), (sx + 2, sy - 1), (sx + 2, sy - 2)),
+            ((sx + 2, sy + 1), (sx + 2, sy - 1), (sx + 2, sy - 2)),
+        ]
+    return [
+        ((sx - 1, sy + 1), (sx - 1, sy), (sx - 1, sy - 1)),
+        ((sx - 1, sy), (sx - 1, sy - 1), (sx - 1, sy - 2)),
+        ((sx - 1, sy + 1), (sx - 1, sy - 1), (sx - 1, sy - 2)),
+    ]
+
+
+def _cluster_sort_key(cluster, base, region):
+    cells = [pos(cell) for cell in cluster]
+    sx, _ = pos(base)
+    diameter = max(distance(a, b) for a in cells for b in cells)
+    if region == BASE_REGION_TOP_LEFT:
+        facing = 0 if all(x >= sx + 2 for x, _ in cells) else 1
+        pull = -sum(x for x, _ in cells)
     else:
-        primary = ((sx - 1, sy + 1), (sx - 1, sy), (sx, sy + 1))
-        secondary = ((sx - 1, sy - 1), (sx - 1, sy - 2), (sx, sy - 2))
-    return primary, secondary
-
-
-def _nearest_open_cell(anchor, legal, used):
-    available = [cell for cell in legal if cell not in used]
-    if not available:
-        return None
-    return min(available, key=lambda cell: (distance(cell, anchor), cell))
+        facing = 0 if all(x <= sx - 1 for x, _ in cells) else 1
+        pull = sum(x for x, _ in cells)
+    return (0 if _cluster_connected(cells) else 1, facing, diameter, pull,
+            sum(distance(cell, base) for cell in cells), tuple(sorted(cells)))
 
 
 def generate_rocket_positions(base, width, height, blocked=()):
-    """Pick up to three clustered legal weapon cells beside the station."""
+    """Pick up to three clustered rockets a character can walk in and fire."""
     if not base:
         LOG.info("rocket layout skipped: no station")
         return []
@@ -536,14 +625,25 @@ def generate_rocket_positions(base, width, height, blocked=()):
         LOG.info("rocket layout skipped: no legal inner-ring cells")
         return []
     region = base_region(base, width, height)
+    for cluster in _preferred_rocket_clusters(base, region):
+        chosen = [cell for cell in cluster if cell in legal]
+        if len(chosen) == ROCKET_TURRET_COUNT and cluster_is_operable(
+                base, chosen, width, height, blocked):
+            LOG.info("rocket layout preferred %s", chosen)
+            return chosen
+    operable = []
+    for combo in combinations(sorted(legal), ROCKET_TURRET_COUNT):
+        if not _cluster_connected(combo):
+            continue
+        if cluster_is_operable(base, combo, width, height, blocked):
+            operable.append(combo)
+    if operable:
+        best = min(operable, key=lambda cluster: _cluster_sort_key(cluster, base, region))
+        LOG.info("rocket layout fallback %s", best)
+        return list(best)
+    # Safe degrade: nearest connected legal cells, even if a pad is currently blocked.
     chosen = []
-    for cluster in _rocket_region_clusters(base, region):
-        for cell in cluster:
-            if cell in legal and cell not in chosen:
-                chosen.append(cell)
-            if len(chosen) >= ROCKET_TURRET_COUNT:
-                return chosen[:ROCKET_TURRET_COUNT]
-    remaining = legal - set(chosen)
+    remaining = set(legal)
     while len(chosen) < ROCKET_TURRET_COUNT and remaining:
         anchor = chosen[-1] if chosen else pos(base)
         nxt = min(remaining, key=lambda cell: (
@@ -556,8 +656,8 @@ def generate_rocket_positions(base, width, height, blocked=()):
         remaining.remove(nxt)
     if len(chosen) < ROCKET_TURRET_COUNT:
         LOG.info("rocket layout degraded: only %s legal cells", len(chosen))
-    elif not _cluster_connected(chosen):
-        LOG.info("rocket layout not fully adjacent: %s", chosen)
+    else:
+        LOG.info("rocket layout degraded: no fully operable cluster, using %s", chosen)
     return chosen[:ROCKET_TURRET_COUNT]
 
 
@@ -581,6 +681,13 @@ def template_wall_cells(base, width, height):
             cells.add((sx + dx, sy + 2))
             cells.add((sx + dx, sy - 3))
     return [cell for cell in sorted(cells) if _in_bounds(cell, width, height)]
+
+
+def _nearest_open_cell(anchor, legal, used):
+    available = [cell for cell in legal if cell not in used]
+    if not available:
+        return None
+    return min(available, key=lambda cell: (distance(cell, anchor), cell))
 
 
 def generate_wall_positions(base, width, height, blocked=(), preferred=()):

@@ -96,6 +96,8 @@ class Strategy:
         self._summons_used = 0
         self._wall_slots = []
         self._seen_walls = set()
+        self._rocket_cells = []
+        self._cover_id = None
 
     def callback(self, data):
         if not isinstance(data, dict) or not isinstance(data.get('teamOur'), dict):
@@ -122,6 +124,8 @@ class Strategy:
             self._summons_used = 0
             self._wall_slots = []
             self._seen_walls = set()
+            self._rocket_cells = []
+            self._cover_id = None
             self._cached = None
             self._round = None
             self._identity = identity
@@ -185,12 +189,14 @@ class Strategy:
         available = [r for r in w.people if not (active and r['roleType'] == 'pioneer')]
         pioneers_ready = [r for r in available if r['roleType'] == 'pioneer']
         assignments = defense_assignments(w, pioneers_ready)
+        self._cover_id = self._night_cover_id(available, assignments)
         LOG.info(
-            "round=%s night=%s cycle_left=%s walls=%s/%s stone_gap=%s fixer=%s/%s base_hp=%.3f upgrades=%s",
+            "round=%s night=%s cycle_left=%s walls=%s/%s stone_gap=%s fixer=%s/%s base_hp=%.3f upgrades=%s cover=%s",
             data.get('roundNo'), w.night, w.remaining_cycle,
             self._effective_walls(), TARGET_WALL_COUNT, self._stone_deficit(),
             self._fixer_stock(), WALL_REPAIR_KIT_TARGET_STOCK,
-            self._base_health_ratio(), upgrade_group_order(self._base_health_ratio()))
+            self._base_health_ratio(), upgrade_group_order(self._base_health_ratio()),
+            self._cover_id)
         # Medicines and upgrades consume a controller action; remove that controller from firing.
         for role in available:
             self._use_emergency(role)
@@ -201,26 +207,32 @@ class Strategy:
             if str(role['id']) not in self.commands:
                 self._use_summon(role)
         if w.night:
+            operator = self._pick_gun_operator(available)
             firing = {}
-            for role in pioneers_ready:
-                rid = str(role['id'])
-                if rid in self.commands:
-                    continue
-                gun = self._rotate_gun(role) or assignments.get(rid)
+            if operator and str(operator['id']) not in self.commands:
+                gun = self._rotate_gun(operator) or assignments.get(str(operator['id']))
                 if gun:
-                    firing[rid] = gun
+                    firing[str(operator['id'])] = gun
             attacks, controllers = plan_attacks(w, firing)
             self.commands.update(attacks)
+            operator_id = str(operator['id']) if operator else None
             for role in available:
                 rid = str(role['id'])
                 if rid in self.commands or rid in controllers:
                     continue
-                if role['roleType'] == 'pioneer':
+                if rid == operator_id:
                     gun = firing.get(rid) or self._rotate_gun(role)
                     if gun:
                         self._go(role, [pos(gun)])
-                    elif not self._task_or_treasure(role, allow_new_task=False):
+                    else:
                         self._shelter(role)
+                elif role['roleType'] == 'pioneer':
+                    if not self._task_or_treasure(role, allow_new_task=False):
+                        gun = self._rotate_gun(role)
+                        if gun:
+                            self._go(role, [pos(gun)])
+                        else:
+                            self._shelter(role)
                 else:
                     self._night_worker(role)
             return response
@@ -239,6 +251,9 @@ class Strategy:
                     if not self._shopping(role):
                         self._go(role, [pos(gun)]) if gun else self._shelter(role)
             else:
+                if (self._cover_id == rid and self.w.guns
+                        and self._return_to_guns(role)):
+                    continue
                 if self._build(role):
                     continue
                 if self._stone_deficit() > 0 and self._gather(role):
@@ -305,15 +320,26 @@ class Strategy:
     def _remaining_cycle(self):
         return int(getattr(self.w, 'remaining_cycle', self.w.remaining_day))
 
+    def _bag_capacity(self, role):
+        return max(0, int(role.get('backPackCapability', 100)))
+
+    def _bag_space(self, role):
+        return max(0, self._bag_capacity(role) - len(role.get('backpack', [])))
+
+    def _bag_full(self, role):
+        return self._bag_space(role) <= 0
+
     def _refresh_layout(self):
         if not self.w.base:
             self._rocket_cells = []
             self._wall_plan = []
             return
         gun_cells = {pos(gun) for gun in self.w.guns}
-        rocket_blocked = (self.w.blocked | set(self.failed_cells)) - gun_cells
-        self._rocket_cells = generate_rocket_positions(
-            self.w.base, self.w.width, self.w.height, rocket_blocked)
+        mobile = {pos(role) for role in self.w.people} | {pos(robot) for robot in self.w.robots}
+        rocket_blocked = (self.w.blocked | set(self.failed_cells)) - gun_cells - mobile
+        if len(self._rocket_cells) != ROCKET_TURRET_COUNT:
+            self._rocket_cells = generate_rocket_positions(
+                self.w.base, self.w.width, self.w.height, rocket_blocked)
         our_walls = {pos(role) for role in self.w.ours if role.get('roleType') == 'wall'}
         wall_blocked = (self.w.blocked | set(self.failed_cells)) - our_walls
         if len(self._wall_slots) == TARGET_WALL_COUNT:
@@ -369,10 +395,83 @@ class Strategy:
         adjacent = [gun for gun in ready if distance(role, gun) == 1]
         if adjacent:
             return min(adjacent, key=lambda gun: str(gun['id']))
+        reachable = []
+        for gun in ready or guns:
+            path = self._path(role, [pos(gun)])
+            if path:
+                reachable.append((len(path), int(gun.get('cooldown', 0)), str(gun['id']), gun))
+        if reachable:
+            return min(reachable)[-1]
         if ready:
             return min(ready, key=lambda gun: (distance(role, gun), str(gun['id'])))
         return min(guns, key=lambda gun: (int(gun.get('cooldown', 0)),
                                           distance(role, gun), str(gun['id'])))
+
+    def _pick_gun_operator(self, available):
+        """Keep at least one reachable character on the rockets at night."""
+        guns = list(self.w.guns)
+        if not guns:
+            return None
+        ranked = []
+        for role in available:
+            rid = str(role['id'])
+            if rid in self.commands:
+                continue
+            path = self._path(role, [pos(gun) for gun in guns])
+            if path is None:
+                continue
+            adjacent = any(distance(role, gun) == 1 for gun in guns)
+            ranked.append((
+                0 if adjacent else 1,
+                0 if role.get('roleType') == 'pioneer' else 1,
+                len(path),
+                rid,
+                role,
+            ))
+        if ranked:
+            chosen = min(ranked)
+            LOG.info("night operator %s adjacent=%s path=%s",
+                     chosen[-1].get('id'), chosen[0] == 0, chosen[2])
+            return chosen[-1]
+        people = [role for role in available if str(role['id']) not in self.commands]
+        if not people:
+            return None
+        return min(people, key=lambda role: (
+            role.get('roleType') != 'pioneer', distance(role, guns[0]), str(role['id'])))
+
+    def _night_cover_id(self, available, assignments):
+        """If the pioneer cannot be at the guns by nightfall, send a worker back."""
+        guns = list(self.w.guns)
+        if not guns:
+            return None
+        pioneer = next((role for role in available if role.get('roleType') == 'pioneer'), None)
+        margin = self._return_margin()
+        if pioneer:
+            gun = assignments.get(str(pioneer['id'])) or guns[0]
+            path = self._path(pioneer, [pos(gun)])
+            if path is not None and (self.w.night or len(path) - 1 <= self.w.remaining_day - margin):
+                return None
+        workers = [role for role in available if role.get('roleType') == 'worker'
+                   and str(role['id']) not in self.commands]
+        ranked = []
+        for role in workers:
+            path = self._path(role, [pos(gun) for gun in guns])
+            if path is not None:
+                ranked.append((len(path), str(role['id'])))
+        return ranked[0][1] if ranked else None
+
+    def _return_to_guns(self, role):
+        guns = list(self.w.guns)
+        if not guns:
+            return False
+        path = self._path(role, [pos(gun) for gun in guns])
+        if not path:
+            return False
+        if self.w.night or self.w.remaining_day <= len(path) - 1 + self._return_margin():
+            LOG.info("worker %s covering guns, steps=%s day_left=%s",
+                     role.get('id'), len(path) - 1, self.w.remaining_day)
+            return self._go(role, [pos(gun) for gun in guns])
+        return False
 
     def _worker_direct_danger(self, role):
         if int(role.get('health', 0)) <= 80:
@@ -547,15 +646,12 @@ class Strategy:
         return True
 
     def _stone_quota(self, role):
-        capacity = int(role.get('backPackCapability', 100))
-        have = Counter(role.get('backpack', []))['stone']
-        return max(0, min(capacity, have + self._stone_deficit()))
+        """How many stones this worker should carry: fill remaining bag space."""
+        return self._bag_capacity(role)
 
     def _gather(self, role):
-        """Fill only the stone gap required for walls or rebuilds."""
-        capacity = int(role.get('backPackCapability', 100))
-        bag = role.get('backpack', [])
-        if len(bag) >= capacity or self._stone_deficit() <= 0:
+        """Keep collecting the current priority ore until the backpack is full."""
+        if self._bag_full(role) or self._stone_deficit() <= 0:
             return False
         blocked = getattr(self.reasoning, 'blocked_ores', set())
         if 'stone' in blocked:
@@ -597,21 +693,17 @@ class Strategy:
             return True
         if not self._can_complete_sell(role):
             return False
-        bag_size = len(role.get('backpack', []))
-        market_value = sum(ore_counts[ore] * self.prices[ore] for ore in ore_counts)
-        target_value = int((self.config.get('economy') or {}).get('sell_value_threshold', 20))
-        if len(self.w.guns) == 2 and self.w.day == 1:
-            target_value = max(target_value, 25)
-        if force or market_value >= target_value or bag_size >= min(20, role.get('backPackCapability', 100)):
-            LOG.info("go vendor value=%s cycle=%s cost=%s",
-                     market_value, self._remaining_cycle(), self._sell_turns(role))
-            return self._go(role, vendors)
-        return False
+        if not force and not self._bag_full(role):
+            LOG.info("hold sell until bag full space=%s role=%s",
+                     self._bag_space(role), role.get('id'))
+            return False
+        LOG.info("go vendor bag=%s/%s cycle=%s cost=%s",
+                 len(role.get('backpack', [])), self._bag_capacity(role),
+                 self._remaining_cycle(), self._sell_turns(role))
+        return self._go(role, vendors)
 
     def _mine(self, role, return_steps=0):
-        capacity = int(role.get('backPackCapability', 100))
-        bag = role.get('backpack', [])
-        if len(bag) >= capacity:
+        if self._bag_full(role):
             return self._sell(role, True)
         blocked = getattr(self.reasoning, 'blocked_ores', set())
         deficit = self._stone_deficit()
@@ -623,23 +715,11 @@ class Strategy:
         if not candidates:
             return self._sell(role, True)
         _, _, ore, target, path = max(candidates)
-        remaining_collect = min(
-            capacity - len(bag),
-            max(1, 10 - self._mine_yield[(target, ore)]),
-        )
-        if deficit > 0 and ore == 'stone':
-            remaining_collect = min(remaining_collect, deficit)
-        flow = self._collect_sell_flow(role, path, remaining_collect)
+        fill_amount = self._bag_space(role)
+        flow = self._collect_sell_flow(role, path, fill_amount)
         cycle = self._remaining_cycle()
-        LOG.info("mine target=%s ore=%s flow=%s cycle=%s stone_gap=%s",
-                 target, ore, flow, cycle, deficit)
-        sellable = self._sellable_ores(role)
-        value = sum(sellable[item] * self.prices[item] for item in sellable)
-        threshold = int((self.config.get('economy') or {}).get('sell_value_threshold', 20))
-        if (len(path) > 1 and sellable and value >= threshold
-                and not can_complete_same_day(cycle, flow)
-                and self._can_complete_sell(role)):
-            return self._sell(role)
+        LOG.info("mine target=%s ore=%s fill=%s flow=%s cycle=%s stone_gap=%s",
+                 target, ore, fill_amount, flow, cycle, deficit)
         if len(path) == 1:
             self.commands[str(role['id'])] = command('collect', target)
             return True
@@ -761,7 +841,8 @@ class Strategy:
             LOG.info("wall build skipped: no reachable missing cell")
             return False
         stones = Counter(role.get('backpack', []))['stone']
-        if stones < 1 and self._gather(role):
+        if (not self._bag_full(role) and stones < max(1, len(missing))
+                and self._gather(role)):
             return True
         if not stones:
             return False
