@@ -7,7 +7,7 @@ from agent.brain import (BASE_LOW_HEALTH_RATIO, Strategy, WALL_REPAIR_KIT,
                          fixer_restock_count, preferred_ores, upgrade_group_order,
                          wall_stone_deficit)
 from agent.grid import (ROCKET_TURRET_COUNT, TARGET_WALL_COUNT, World,
-                        _cluster_connected, base_region, building_rings,
+                        base_region, building_rings,
                         cluster_is_operable, generate_rocket_positions,
                         generate_wall_positions, template_wall_cells)
 
@@ -123,24 +123,24 @@ def bind(strategy, data, **attrs):
 
 
 class LayoutTests(unittest.TestCase):
-    def test_top_left_rockets_are_clustered_on_the_right(self):
+    def test_top_left_rockets_match_specified_offsets(self):
         base = station(*TOP_LEFT_BASE)
+        x, y = TOP_LEFT_BASE
         cells = generate_rocket_positions(base, MAP_W, MAP_H)
-        self.assertEqual(len(cells), ROCKET_TURRET_COUNT)
-        self.assertTrue(_cluster_connected(cells))
         self.assertEqual(base_region(base, MAP_W, MAP_H), "top_left")
-        self.assertTrue(all(x >= TOP_LEFT_BASE[0] + 1 for x, y in cells))
+        self.assertEqual(cells, [(x - 1, y), (x - 1, y - 2), (x, y - 2)])
         blue, _ = building_rings(base, MAP_W, MAP_H)
         self.assertTrue(set(cells) <= blue)
         self.assertTrue(cluster_is_operable(base, cells, MAP_W, MAP_H))
 
-    def test_bottom_right_rockets_are_mirrored_on_the_left(self):
+    def test_bottom_right_rockets_match_specified_offsets(self):
         base = station(*BOTTOM_RIGHT_BASE)
+        x, y = BOTTOM_RIGHT_BASE
         cells = generate_rocket_positions(base, MAP_W, MAP_H)
-        self.assertEqual(len(cells), ROCKET_TURRET_COUNT)
-        self.assertTrue(_cluster_connected(cells))
         self.assertEqual(base_region(base, MAP_W, MAP_H), "bottom_right")
-        self.assertTrue(all(x <= BOTTOM_RIGHT_BASE[0] for x, y in cells))
+        self.assertEqual(cells, [(x + 2, y - 1), (x + 2, y + 1), (x + 1, y + 1)])
+        blue, _ = building_rings(base, MAP_W, MAP_H)
+        self.assertTrue(set(cells) <= blue)
         top = generate_rocket_positions(station(*TOP_LEFT_BASE), MAP_W, MAP_H)
         self.assertNotEqual(set(cells), set(top))
         self.assertTrue(cluster_is_operable(base, cells, MAP_W, MAP_H))

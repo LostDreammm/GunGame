@@ -578,39 +578,63 @@ def cluster_is_operable(base, cluster, width, height, extra_blocked=()):
     return all(any(pad in reachable for pad in pads) for pads in pads_by_gun)
 
 
-def _preferred_rocket_clusters(base, region):
-    """Right-column (top-left) / left-column (bottom-right) lines of three.
+def specified_rocket_offsets(region):
+    """Offsets from the station's top-left cell (x, y).
 
-    These sit on the enemy-facing blue edge but leave the top and bottom
-    corridors along the station free, so a controller can walk in with
-    8-direction movement after the C-shaped wall is up.
+    Top-left:  (x-1, y), (x-1, y-2), (x, y-2)
+    Bottom-right: (x+2, y-1), (x+2, y+1), (x+1, y+1)
     """
-    sx, sy = pos(base)
     if region == BASE_REGION_TOP_LEFT:
-        return [
-            ((sx + 2, sy + 1), (sx + 2, sy), (sx + 2, sy - 1)),
-            ((sx + 2, sy), (sx + 2, sy - 1), (sx + 2, sy - 2)),
-            ((sx + 2, sy + 1), (sx + 2, sy - 1), (sx + 2, sy - 2)),
-        ]
-    return [
-        ((sx - 1, sy + 1), (sx - 1, sy), (sx - 1, sy - 1)),
-        ((sx - 1, sy), (sx - 1, sy - 1), (sx - 1, sy - 2)),
-        ((sx - 1, sy + 1), (sx - 1, sy - 1), (sx - 1, sy - 2)),
-    ]
+        return ((-1, 0), (-1, -2), (0, -2))
+    return ((2, -1), (2, 1), (1, 1))
+
+
+def _step_to_blue(sx, sy, dx, dy, legal, used):
+    """Honor the requested offset; if it lands on the 2x2, keep stepping out."""
+    cell = (sx + dx, sy + dy)
+    if cell in legal and cell not in used:
+        return cell
+    step_x = 0 if dx == 0 else (1 if dx > 0 else -1)
+    step_y = 0 if dy == 0 else (1 if dy > 0 else -1)
+    x, y = cell
+    for _ in range(4):
+        x += step_x
+        y += step_y
+        cand = (x, y)
+        if cand in legal and cand not in used:
+            return cand
+    remaining = [item for item in legal if item not in used]
+    if not remaining:
+        return None
+    return min(remaining, key=lambda item: (distance(item, cell), item))
+
+
+def _specified_rocket_cells(base, legal, region):
+    sx, sy = pos(base)
+    chosen = []
+    for dx, dy in specified_rocket_offsets(region):
+        cell = _step_to_blue(sx, sy, dx, dy, legal, chosen)
+        if cell is None:
+            break
+        chosen.append(cell)
+    return chosen
+
+
+def _preferred_rocket_clusters(base, region):
+    """Single specified trio used when a listed cell is blocked."""
+    sx, sy = pos(base)
+    return [tuple((sx + dx, sy + dy) for dx, dy in specified_rocket_offsets(region))]
 
 
 def _cluster_sort_key(cluster, base, region):
     cells = [pos(cell) for cell in cluster]
-    sx, _ = pos(base)
-    diameter = max(distance(a, b) for a in cells for b in cells)
+    sx, sy = pos(base)
     if region == BASE_REGION_TOP_LEFT:
-        facing = 0 if all(x >= sx + 2 for x, _ in cells) else 1
-        pull = -sum(x for x, _ in cells)
+        facing = 0 if all(x <= sx for x, _ in cells) else 1
     else:
-        facing = 0 if all(x <= sx - 1 for x, _ in cells) else 1
-        pull = sum(x for x, _ in cells)
-    return (0 if _cluster_connected(cells) else 1, facing, diameter, pull,
-            sum(distance(cell, base) for cell in cells), tuple(sorted(cells)))
+        facing = 0 if all(x >= sx + 1 for x, _ in cells) else 1
+    spread = max(distance(a, b) for a in cells for b in cells) if cells else 0
+    return (facing, spread, tuple(sorted(cells)))
 
 
 def generate_rocket_positions(base, width, height, blocked=()):
@@ -625,6 +649,10 @@ def generate_rocket_positions(base, width, height, blocked=()):
         LOG.info("rocket layout skipped: no legal inner-ring cells")
         return []
     region = base_region(base, width, height)
+    specified = _specified_rocket_cells(base, legal, region)
+    if len(specified) == ROCKET_TURRET_COUNT:
+        LOG.info("rocket layout specified %s", specified)
+        return specified
     for cluster in _preferred_rocket_clusters(base, region):
         chosen = [cell for cell in cluster if cell in legal]
         if len(chosen) == ROCKET_TURRET_COUNT and cluster_is_operable(
