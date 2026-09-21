@@ -98,6 +98,8 @@ class Strategy:
         self._seen_walls = set()
         self._rocket_cells = []
         self._cover_id = None
+        self._sold_this_night = False
+        self._must_sell_today = False
 
     def callback(self, data):
         if not isinstance(data, dict) or not isinstance(data.get('teamOur'), dict):
@@ -126,6 +128,8 @@ class Strategy:
             self._seen_walls = set()
             self._rocket_cells = []
             self._cover_id = None
+            self._sold_this_night = False
+            self._must_sell_today = False
             self._cached = None
             self._round = None
             self._identity = identity
@@ -145,6 +149,10 @@ class Strategy:
                         self._movement_failures = min(8, self._movement_failures + 2)
                     elif result is True:
                         self._movement_failures = max(0, self._movement_failures - 1)
+                if result is True and old.get('action') == 'sell':
+                    if self._was_night:
+                        self._sold_this_night = True
+                    self._must_sell_today = False
                 if result is True and old.get('action') == 'collect':
                     targets = old.get('targetPos') or []
                     if len(targets) == 1:
@@ -207,7 +215,8 @@ class Strategy:
             if str(role['id']) not in self.commands:
                 self._use_summon(role)
         if w.night:
-            operator = self._pick_gun_operator(available)
+            prefer_pioneer = not (pioneer and not active and self._available_player_tasks())
+            operator = self._pick_gun_operator(available, prefer_pioneer=prefer_pioneer)
             firing = {}
             if operator and str(operator['id']) not in self.commands:
                 gun = self._rotate_gun(operator) or assignments.get(str(operator['id']))
@@ -227,7 +236,7 @@ class Strategy:
                     else:
                         self._shelter(role)
                 elif role['roleType'] == 'pioneer':
-                    if not self._task_or_treasure(role, allow_new_task=False):
+                    if not self._task_or_treasure(role, allow_new_task=True):
                         gun = self._rotate_gun(role)
                         if gun:
                             self._go(role, [pos(gun)])
@@ -241,18 +250,23 @@ class Strategy:
             if rid in self.commands:
                 continue
             if role['roleType'] == 'pioneer':
+                if self._task_or_treasure(role, allow_new_task=True):
+                    continue
                 gun = assignments.get(rid)
                 home_path = self._path(role, [pos(gun)]) if gun else None
                 return_steps = len(home_path) - 1 if home_path else 0
                 if gun and w.remaining_day <= return_steps + self._return_margin():
                     self._go(role, [pos(gun)])
                     continue
-                if not self._task_or_treasure(role, allow_new_task=True):
-                    if not self._shopping(role):
-                        self._go(role, [pos(gun)]) if gun else self._shelter(role)
+                if not self._shopping(role):
+                    self._go(role, [pos(gun)]) if gun else self._shelter(role)
             else:
                 if (self._cover_id == rid and self.w.guns
                         and self._return_to_guns(role)):
+                    continue
+                if self._must_sell_today and self._sellable_ores(role) and self._sell(role, True):
+                    continue
+                if self._must_sell_today and not self._team_has_sellable() and self._mine(role):
                     continue
                 if self._build(role):
                     continue
@@ -271,6 +285,8 @@ class Strategy:
             self._current_night_peak = 0.0
             self._current_wave_mix = Counter()
             self._current_wave_ids = set()
+            self._must_sell_today = not self._sold_this_night
+            self._sold_this_night = False
         if self.w.night:
             self._current_night_peak = max(
                 self._current_night_peak, projected_base_damage(self.w, 15))
@@ -407,7 +423,7 @@ class Strategy:
         return min(guns, key=lambda gun: (int(gun.get('cooldown', 0)),
                                           distance(role, gun), str(gun['id'])))
 
-    def _pick_gun_operator(self, available):
+    def _pick_gun_operator(self, available, prefer_pioneer=True):
         """Keep at least one reachable character on the rockets at night."""
         guns = list(self.w.guns)
         if not guns:
@@ -421,9 +437,13 @@ class Strategy:
             if path is None:
                 continue
             adjacent = any(distance(role, gun) == 1 for gun in guns)
+            if prefer_pioneer:
+                role_rank = 0 if role.get('roleType') == 'pioneer' else 1
+            else:
+                role_rank = 0 if role.get('roleType') != 'pioneer' else 1
             ranked.append((
+                role_rank,
                 0 if adjacent else 1,
-                0 if role.get('roleType') == 'pioneer' else 1,
                 len(path),
                 rid,
                 role,
@@ -431,13 +451,14 @@ class Strategy:
         if ranked:
             chosen = min(ranked)
             LOG.info("night operator %s adjacent=%s path=%s",
-                     chosen[-1].get('id'), chosen[0] == 0, chosen[2])
+                     chosen[-1].get('id'), chosen[1] == 0, chosen[2])
             return chosen[-1]
         people = [role for role in available if str(role['id']) not in self.commands]
         if not people:
             return None
         return min(people, key=lambda role: (
-            role.get('roleType') != 'pioneer', distance(role, guns[0]), str(role['id'])))
+            (role.get('roleType') == 'pioneer') if not prefer_pioneer else (role.get('roleType') != 'pioneer'),
+            distance(role, guns[0]), str(role['id'])))
 
     def _night_cover_id(self, available, assignments):
         """If the pioneer cannot be at the guns by nightfall, send a worker back."""
@@ -446,7 +467,7 @@ class Strategy:
             return None
         pioneer = next((role for role in available if role.get('roleType') == 'pioneer'), None)
         margin = self._return_margin()
-        if pioneer:
+        if pioneer and not self._available_player_tasks():
             gun = assignments.get(str(pioneer['id'])) or guns[0]
             path = self._path(pioneer, [pos(gun)])
             if path is not None and (self.w.night or len(path) - 1 <= self.w.remaining_day - margin):
@@ -482,6 +503,8 @@ class Strategy:
         if self._worker_direct_danger(role):
             LOG.info("worker %s interrupt mining: direct danger", role.get('id'))
             return self._shelter(role)
+        if self._must_sell_today and self._sellable_ores(role) and self._sell(role, True):
+            return True
         if self._stone_deficit() > 0 and self._gather(role):
             return True
         if self._mine(role):
@@ -679,6 +702,9 @@ class Strategy:
             return True
         return self._go(role, [target])
 
+    def _team_has_sellable(self):
+        return any(self._sellable_ores(role) for role in self.w.people)
+
     def _sell(self, role, force=False, keep=None):
         if role.get('roleType') == 'worker' and not self._selling_open():
             return False
@@ -693,7 +719,7 @@ class Strategy:
             return True
         if not self._can_complete_sell(role):
             return False
-        if not force and not self._bag_full(role):
+        if not force and not self._must_sell_today and not self._bag_full(role):
             LOG.info("hold sell until bag full space=%s role=%s",
                      self._bag_space(role), role.get('id'))
             return False
@@ -1036,50 +1062,67 @@ class Strategy:
                 return name, min(3, 10 - self._summons_used)
         return None
 
+    def _available_player_tasks(self):
+        side = (self.w.data.get('teamOur') or {}).get('type', '')
+        ledger = getattr(self.reasoning, 'ledger', None)
+        ready = []
+        for task in (self.w.data.get('teamOur') or {}).get('playerTasks') or []:
+            if not isinstance(task, dict):
+                continue
+            family = str(task.get('taskType', ''))
+            if ledger and ledger.evolution_complete():
+                continue
+            if ledger and ledger.family_exhausted(family, task):
+                continue
+            cooldown = int(task.get('coldDownRounds', 0) or 0)
+            valid = bool(task.get('isValid')) and cooldown <= 0
+            pending = bool(ledger and ledger.pending_claim_family == family)
+            if not valid and not pending:
+                continue
+            if valid and ledger and ledger.should_defer_new_claim() and not pending:
+                continue
+            anchor = task.get('taskPosition') or {}
+            if not isinstance(anchor, dict) or 'x' not in anchor or 'y' not in anchor:
+                continue
+            cells = self._task_cells((int(anchor['x']), int(anchor['y'])), side)
+            if cells:
+                ready.append((task, cells, pending, valid))
+        return ready
+
     def _task_or_treasure(self, role, allow_new_task):
+        if allow_new_task and self._accept_task(role):
+            return True
         if self.defense_mode == 'critical':
             return False
-        if self._treasure(role):
-            return True
-        if not allow_new_task:
+        return self._treasure(role)
+
+    def _accept_task(self, role):
+        if self.w.data.get('phaseTask'):
             return False
-        tasks = []
-        side = self.w.data['teamOur'].get('type', '')
-        for task in self.w.data['teamOur'].get('playerTasks', []):
-            if not task.get('isValid') or task.get('coldDownRounds', 0) > 0:
-                continue
-            anchor = (task['taskPosition']['x'], task['taskPosition']['y'])
-            cells = self._task_cells(anchor, side)
-            if not cells:
-                continue
+        ledger = getattr(self.reasoning, 'ledger', None)
+        if ledger and ledger.evolution_complete():
+            return False
+        best = None
+        for item in self._available_player_tasks():
+            task, cells = item[0], item[1]
+            pending = item[2] if len(item) > 2 else False
+            valid = item[3] if len(item) > 3 else True
             route = self._path(role, cells)
             if not route:
                 continue
-            # Reserve task time and travel back to defenses before nightfall.
-            home = min((distance(anchor, pos(g)) for g in self.w.guns), default=0)
-            budget = max(1, int(task.get('timeoutRounds', 15) or 15))
-            family = str(task.get('taskType', 'unknown'))
-            familiarity = getattr(self.reasoning, 'task_familiarity', lambda _: 0)(family)
-            # Walking away only forfeits the task, so budget the rounds the
-            # solver actually needs instead of the whole timeout.
-            estimate = max(2, int((self.config.get('tasks') or {}).get('solve_estimate', 6)))
-            task_rounds = min(budget, 3 if familiarity else estimate)
-            margin = self._return_margin() + (4 if self.defense_mode == 'defensive' else 0)
-            travel = len(route) - 1
-            if travel + task_rounds + home + margin >= self.w.remaining_day:
-                continue
-            probability = 0.9 if familiarity else 0.65
-            reward = max(0, float(task.get('scoreReward', 0)))
-            speed_bonus = 5.0 * budget / max(1, task_rounds)
-            expected = probability * (reward + speed_bonus)
-            expected += (1.0 - probability) * reward * 0.35
-            expected += probability * 0.3 * max(0, float(task.get('goldReward', 0)))
-            utility = expected / max(1, travel + task_rounds)
-            tasks.append((utility, cells, route))
-        if not tasks:
+            key = (0 if pending else 1, 0 if valid else 1, len(route),
+                   -float(task.get('scoreReward', 0) or 0), str(task.get('taskType', '')))
+            if best is None or key < best[0]:
+                best = (key, cells, route, task, pending, valid)
+        if not best:
             return False
-        _, cells, route = max(tasks, key=lambda t: t[0])
+        _, cells, route, task, pending, valid = best
         if len(route) == 1:
+            if pending or not valid:
+                return True
+            family = str(task.get('taskType', ''))
+            if ledger:
+                ledger.note_claim_attempt(family)
             self.commands[str(role['id'])] = command('acceptTask')
             return True
         return self._go(role, cells)

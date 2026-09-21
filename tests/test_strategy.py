@@ -182,6 +182,23 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(generate_wall_positions(None, MAP_W, MAP_H), [])
 
 
+def add_self_task(data, x=8, y=20):
+    team = data["teamOur"]["type"]
+    data["mapInfo"]["zones"].append({
+        "neutralType": team + "TaskPoint1", "pos": {"x": x, "y": y},
+    })
+    data["teamOur"]["playerTasks"] = [{
+        "taskType": "自进化类1",
+        "taskPosition": {"x": x, "y": y},
+        "isValid": True,
+        "coldDownRounds": 0,
+        "timeoutRounds": 40,
+        "scoreReward": 50,
+        "goldReward": 10,
+    }]
+    return data
+
+
 class NightAndEconomyTests(unittest.TestCase):
     def test_night_only_pioneer_controls_guns_workers_keep_mining(self):
         sx, sy = TOP_LEFT_BASE
@@ -359,6 +376,132 @@ class NightAndEconomyTests(unittest.TestCase):
         late.w.ours.extend(fake_walls)
         self.assertFalse(late._can_complete_sell(worker))
         self.assertFalse(late._sell(worker, True))
+
+    def test_pioneer_does_not_double_accept_before_phase_arrives(self):
+        data = add_self_task(snapshot())
+        strategy = Strategy(CONFIG)
+        accepted = False
+        for _ in range(24):
+            result = strategy.callback(data)
+            cmd = result["roleCommandMap"].get("2", {})
+            if cmd.get("action") == "acceptTask":
+                accepted = True
+                break
+            if cmd.get("action") == "move" and cmd.get("targetPos"):
+                data["teamOur"]["roles"][1]["pos"] = dict(cmd["targetPos"][0])
+            data["roundNo"] = int(data["roundNo"]) + 1
+        self.assertTrue(accepted)
+        data["roundNo"] = int(data["roundNo"]) + 1
+        later = strategy.callback(data)
+        self.assertNotEqual(later["roleCommandMap"].get("2", {}).get("action"), "acceptTask")
+
+    def test_pioneer_claims_again_after_previous_task_finishes(self):
+        data = add_self_task(snapshot())
+        strategy = Strategy(CONFIG)
+        accepted = 0
+        for _ in range(40):
+            result = strategy.callback(data)
+            cmd = result["roleCommandMap"].get("2", {})
+            if cmd.get("action") == "acceptTask":
+                accepted += 1
+                if accepted == 1:
+                    strategy.reasoning.ledger.pending_claim_family = None
+                    if strategy.reasoning.ledger.current():
+                        strategy.reasoning.ledger.mark_current_completed()
+                    data["roundNo"] = int(data["roundNo"]) + 1
+                    continue
+                break
+            if cmd.get("action") == "move" and cmd.get("targetPos"):
+                data["teamOur"]["roles"][1]["pos"] = dict(cmd["targetPos"][0])
+            data["roundNo"] = int(data["roundNo"]) + 1
+        self.assertGreaterEqual(accepted, 2)
+
+    def test_pioneer_accepts_task_even_near_nightfall(self):
+        data = add_self_task(snapshot(round_no=66))
+        result = Strategy(CONFIG).callback(data)
+        cmd = result["roleCommandMap"].get("2", {})
+        self.assertIn(cmd.get("action"), ("move", "acceptTask"))
+
+    def test_pioneer_prefers_task_over_treasure(self):
+        data = add_self_task(snapshot())
+        strategy = Strategy(CONFIG)
+        strategy.reasoning.treasure = {
+            "pos": {"x": 25, "y": 20}, "items": ["StarSand"],
+            "open_round": 1, "close_round": 2000,
+        }
+        result = strategy.callback(data)
+        cmd = result["roleCommandMap"].get("2", {})
+        self.assertIn(cmd.get("action"), ("move", "acceptTask"))
+        if cmd.get("action") == "move":
+            dest = cmd["targetPos"][0]
+            start = (13, 24)
+            task = (8, 20)
+            altar = (25, 20)
+            after = (dest["x"], dest["y"])
+            self.assertLess(
+                max(abs(after[0] - task[0]), abs(after[1] - task[1])),
+                max(abs(start[0] - task[0]), abs(start[1] - task[1])),
+            )
+            self.assertGreater(
+                max(abs(after[0] - altar[0]), abs(after[1] - altar[1])),
+                max(abs(after[0] - task[0]), abs(after[1] - task[1])),
+            )
+
+    def test_pioneer_takes_tasks_at_night_when_worker_covers(self):
+        sx, sy = TOP_LEFT_BASE
+        rockets = generate_rocket_positions(station(sx, sy), MAP_W, MAP_H)
+        roles = [
+            role(2, rockets[0][0] - 1, rockets[0][1], "pioneer"),
+            role(3, 5, 24, "worker"),
+            role(4, 6, 23, "worker"),
+        ]
+        guns = [
+            role(20 + i, x, y, "rocket", attackRange=10, attackPower=20, cooldown=0)
+            for i, (x, y) in enumerate(rockets)
+        ]
+        data = snapshot(roles=roles, night=True, robots=[
+            role(90, rockets[0][0] + 3, rockets[0][1], "smallRobot", health=30),
+        ])
+        add_self_task(data)
+        data["teamOur"]["roles"] = [station(sx, sy)] + roles + guns
+        result = Strategy(CONFIG).callback(data)
+        commands = result["roleCommandMap"]
+        if commands.get("20", {}).get("action") == "attack":
+            self.assertNotEqual(str(commands["20"]["controllerId"]), "2")
+        self.assertIn(commands.get("2", {}).get("action"), ("move", "acceptTask"))
+
+    def test_must_sell_next_day_if_night_had_no_sell(self):
+        data = snapshot()
+        worker = data["teamOur"]["roles"][2]
+        worker["backpack"] = ["copper"] * 20
+        worker["pos"] = {"x": 4, "y": 24}
+        strategy = bind(Strategy(CONFIG), data)
+        slots = generate_wall_positions(strategy.w.base, MAP_W, MAP_H)
+        strategy._wall_slots = slots
+        strategy._wall_plan = list(slots)
+        strategy.w.ours.extend(role(40 + i, x, y, "wall") for i, (x, y) in enumerate(slots))
+        strategy._was_night = True
+        strategy._sold_this_night = False
+        strategy._observe_world()
+        self.assertTrue(strategy._must_sell_today)
+        self.assertTrue(strategy._sell(worker))
+        self.assertEqual(strategy.commands[str(worker["id"])]["action"], "move")
+
+    def test_no_forced_sell_if_night_already_sold(self):
+        data = snapshot()
+        worker = data["teamOur"]["roles"][2]
+        worker["backpack"] = ["copper"] * 20
+        worker["pos"] = {"x": 4, "y": 24}
+        strategy = bind(Strategy(CONFIG), data)
+        slots = generate_wall_positions(strategy.w.base, MAP_W, MAP_H)
+        strategy._wall_slots = slots
+        strategy._wall_plan = list(slots)
+        strategy.w.ours.extend(role(40 + i, x, y, "wall") for i, (x, y) in enumerate(slots))
+        strategy._was_night = True
+        strategy._sold_this_night = True
+        strategy._observe_world()
+        self.assertFalse(strategy._must_sell_today)
+        self.assertFalse(strategy._sell(worker))
 
 
 if __name__ == "__main__":

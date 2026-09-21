@@ -10,10 +10,12 @@ import re
 
 
 from .task_loop import (
-    ANALYZING, COMPLETED, EXECUTING, FAILED_TERMINAL, LEARNING,
-    MAX_REQUEST_ATTEMPTS, RECEIVED, RETRYING, VALIDATING,
-    advance_execution, apply_skill, buildRetryRequest, extract_city,
-    extract_credential, parse_http_command, redact, skill_text,
+    ANALYZING, ANSWER_READY, API_CATEGORY, COMPLETED, EXECUTING, FAILED_TERMINAL,
+    FILE_CATEGORY, LEARNING, MAX_REQUEST_ATTEMPTS, RECEIVED, RETRYING, SUBMITTING,
+    VALIDATING, TaskLedger, advance_execution, apply_skill, buildApiRequest,
+    buildRetryRequest, canonicalize_api_spec, classifyTaskKind, extract_check_path,
+    extract_city, extract_credential, normalize_submission, parse_http_command,
+    redact, resolveVerifiedApiContract, skill_text,
 )
 ORES = {"stone": ("石矿", "石头"), "iron": ("铁矿", "铁"), "copper": ("铜矿", "铜")}
 ITEM_ALIASES = {
@@ -131,6 +133,7 @@ class Reasoning:
         self._active_skill = None
         self._treasure_finished = False
         self._rejected_treasures = set()
+        self.ledger = TaskLedger()
 
     def update(self, data, day, pioneer_id):
         result = {"prompt": "", "executeCmd": "", "taskAnswer": None}
@@ -171,9 +174,12 @@ class Reasoning:
             self._repair_tries = 0
             self._last_spec = None
             self._task_state = RECEIVED if task else COMPLETED
+            if task:
+                self.ledger.register_from_phase(self._task_family, task)
             self._active_skill = self._select_skill(self._task_family, task)
             self._pending = None
         if 1 in codes:
+            self.ledger.fail_current(error="timeout")
             self._task = ""
             self._pending = None
             self._trace = []
@@ -211,28 +217,31 @@ class Reasoning:
         if pending and current_round <= pending["round"]:
             return result
         self._pending = None
+        codes = {e.get("errorCode") for e in (errors or []) if isinstance(e, dict)}
+        record = self.ledger.current()
+        if record and record.get("state") == COMPLETED:
+            return result
         if pending and pending["kind"] == "task_llm":
             raw_response = data.get("llmResp")
             decision = _json_object(raw_response)
             if decision and decision.get("kind") == "command":
+                if record and record.get("query_done") and record.get("answer"):
+                    return self._submit_prepared(record["answer"], day, current_round, result)
                 command = decision.get("command")
                 if isinstance(command, str) and command.strip() and len(command) <= 8000 and "\x00" not in command:
                     return self._emit_command(command, day, current_round, result)
-            # Submit whatever the model actually produced: a missing "kind",
-            # a fenced object or bare text must not stall the whole task.
             sop = decision.get("sop", "") if decision else ""
             answer = _answer_text(decision.get("answer")) if decision else ""
             if not answer:
                 answer, sop = _plain_task_answer(raw_response), ""
             if answer and len(answer) <= 65536:
-                result["taskAnswer"] = answer
-                self._pending = {"kind": "task_answer", "round": current_round,
-                                 "day": day, "answer": answer,
-                                 "sop": sop[:4000] if isinstance(sop, str) else ""}
-                return result
+                answer = normalize_submission(answer, self._task)
+                return self._submit_prepared(answer, day, current_round, result, sop=sop)
             self._append_trace({"issue": "LLM未返回可用的严格JSON；请按指定格式纠正。",
                                 "response_excerpt": str(data.get("llmResp", ""))[:3000]})
         elif pending and pending["kind"] == "task_cmd":
+            if record and record.get("query_done") and record.get("answer"):
+                return self._submit_prepared(record["answer"], day, current_round, result)
             output = data.get("lastCmdResult") or "[NO_RESULT] 平台本轮未提供上次命令输出，不能假定成功。"
             self._append_trace({"command": pending["command"], "result": str(output)[:24000]})
             if self._follow_sandbox_output(pending["command"], output, data, day, current_round, result):
@@ -240,8 +249,18 @@ class Reasoning:
         elif pending and pending["kind"] == "task_answer":
             self._append_trace({"submitted_answer": pending["answer"], "feedback": errors or
                                 "任务仍在进行，尚无完成确认；检查答案格式、完整性与沙盒证据。"})
+            if 2 in codes:
+                fixed = normalize_submission(pending.get("answer") or "", self._task)
+                if record and record.get("query_done"):
+                    fixed = record.get("answer") or fixed
+                return self._submit_prepared(fixed, day, current_round, result,
+                                             sop=pending.get("sop") or "")
+            if record and record.get("query_done") and record.get("answer"):
+                return result
         if errors:
             self._append_trace({"platform_errors": errors})
+        if record and record.get("query_done") and record.get("answer"):
+            return self._submit_prepared(record["answer"], day, current_round, result)
         if self._task_state == RECEIVED and self._reuse_skill_command(day, current_round, result):
             return result
         self._task_state = ANALYZING
@@ -249,13 +268,36 @@ class Reasoning:
         self._pending = {"kind": "task_llm", "round": current_round, "day": day}
         return result
 
+    def _submit_prepared(self, answer, day, current_round, result, sop=""):
+        answer = normalize_submission(answer, self._task)
+        if not answer:
+            return result
+        result["taskAnswer"] = answer
+        self.ledger.store_answer(answer, query_done=True)
+        record = self.ledger.current()
+        if record:
+            record["state"] = SUBMITTING
+        self._task_state = SUBMITTING
+        self._pending = {"kind": "task_answer", "round": current_round, "day": day,
+                         "answer": answer, "sop": (sop or skill_text(self._active_skill))[:4000]}
+        return result
+
     def _emit_command(self, command, day, current_round, result):
         spec = parse_http_command(command)
         if spec:
-            self._last_spec = spec
+            contract = resolveVerifiedApiContract(self.ledger.verified_api or self._active_skill)
+            spec = canonicalize_api_spec(spec, contract if contract and contract.get("verified") else None)
             secret = extract_credential(spec)
             if secret:
                 self._credential = secret
+            if contract and contract.get("verified") and spec.get("url"):
+                city = extract_city(self._task) or (spec.get("params") or {}).get(
+                    contract.get("location_parameter") or "location"
+                ) or (spec.get("params") or {}).get("city")
+                spec = buildApiRequest(contract, city, self._credential or secret)
+            if spec.get("url"):
+                command = buildRetryRequest(spec) or command
+            self._last_spec = spec
         self._task_state = EXECUTING
         result["executeCmd"] = command
         self._pending = {"kind": "task_cmd", "round": current_round,
@@ -263,25 +305,40 @@ class Reasoning:
         return result
 
     def _select_skill(self, family, task):
+        kind = classifyTaskKind(task)
+        if kind == API_CATEGORY:
+            if self.ledger.verified_api:
+                return self.ledger.verified_api
+            return self._skills.get("api") or self._skills.get(family) or self._skills.get("weather")
+        if kind == FILE_CATEGORY:
+            return self._skills.get("file") or self._skills.get("script") or self._skills.get(family)
         if family and family in self._skills:
             return self._skills[family]
         if extract_city(task) or (task and ("天气" in task or "weather" in task.lower())):
-            return self._skills.get("weather")
+            return self._skills.get("weather") or self._skills.get("api")
         if task and "check" in task:
-            return self._skills.get("script")
+            return self._skills.get("script") or self._skills.get("file")
         return None
 
     def _store_skill(self, skill):
         if not skill:
             return
         self._active_skill = skill
+        kind = classifyTaskKind(self._task)
+        if kind == API_CATEGORY:
+            self._skills["api"] = skill
+            self.ledger.verified_api = resolveVerifiedApiContract(skill) or self.ledger.verified_api
+        if kind == FILE_CATEGORY or skill.get("script"):
+            self._skills["file"] = skill
+            self._skills["script"] = skill
+            self.ledger.file_skill = skill
         if self._task_family:
             self._skills[self._task_family] = skill
         if extract_city(self._task) or (self._task and ("天气" in self._task or "weather" in self._task.lower())):
             self._skills["weather"] = skill
         if skill.get("script"):
             self._skills["script"] = skill
-        lessons = self._lessons.setdefault(self._task_family or "unknown", [])
+        lessons = self._lessons.setdefault(self._task_family or kind or "unknown", [])
         text = skill_text(skill)
         if text and text not in lessons:
             lessons.append(text)
@@ -291,8 +348,18 @@ class Reasoning:
 
     def _reuse_skill_command(self, day, current_round, result):
         skill = self._active_skill
+        record = self.ledger.current()
+        if record and record.get("query_done") and record.get("answer"):
+            self._submit_prepared(record["answer"], day, current_round, result)
+            return True
         if not skill:
             return False
+        if skill.get("kind") == "script" or (skill.get("script") and classifyTaskKind(self._task) == FILE_CATEGORY):
+            path = extract_check_path(self._task)
+            command = path or (skill.get("script") or {}).get("command") or "./check"
+            self._append_trace({"task_state": EXECUTING, "repair": "reuse_file_skill", "command": command})
+            self._emit_command(command, day, current_round, result)
+            return True
         spec = apply_skill(skill, self._task, self._credential)
         if not spec:
             return False
@@ -306,6 +373,7 @@ class Reasoning:
         return True
 
     def _follow_sandbox_output(self, command, output, data, day, current_round, result):
+        record = self.ledger.current() or {}
         action = advance_execution(
             command, output,
             session={
@@ -316,6 +384,9 @@ class Reasoning:
                 "skill": self._active_skill,
                 "spec": self._last_spec,
                 "repair_count": self._repair_tries,
+                "verified_contract": self.ledger.verified_api,
+                "prepared_answer": (record.get("answer") if record and record.get("query_done") else None),
+                "query_complete": bool(record and record.get("query_done") and record.get("answer")),
             },
             task=self._task,
         )
@@ -337,16 +408,16 @@ class Reasoning:
             "reason": action.get("reason"),
         })
         if action["state"] == RETRYING and action.get("executeCmd"):
+            if action.get("stop_query"):
+                return False
             return self._emit_command(action["executeCmd"], day, current_round, result) is not None
-        if action["state"] == LEARNING:
+        if action["state"] in {LEARNING, ANSWER_READY}:
             self._store_skill(action.get("skill"))
             answer = action.get("taskAnswer") or ""
             if answer:
-                result["taskAnswer"] = answer
-                self._task_state = COMPLETED
-                self._pending = {"kind": "task_answer", "round": current_round, "day": day,
-                                 "answer": answer, "sop": skill_text(self._active_skill)}
-                return True
+                self.ledger.store_answer(answer, query_done=True)
+                self._task_state = ANSWER_READY
+                return self._submit_prepared(answer, day, current_round, result) is not None
             self._task_state = VALIDATING
             result["prompt"] = self._task_prompt(data)
             self._pending = {"kind": "task_llm", "round": current_round, "day": day}
@@ -404,6 +475,9 @@ class Reasoning:
 
     def _save_completed_lesson(self, data, codes, pioneer_id, next_task):
         pending = self._pending
+        submitted = bool(pending and pending.get("kind") == "task_answer")
+        if submitted and not codes.intersection({1, 2, 3, 4}):
+            self.ledger.mark_current_completed()
         if (not self._task or next_task or not pending or pending["kind"] != "task_answer"
                 or codes.intersection({1, 2, 3, 4})):
             return
@@ -456,6 +530,14 @@ class Reasoning:
             "计分为任务积分加上5×任务超时回合数/实际用掉回合数，所以越早提交答案得分越高："
             "每一轮都必须在command与answer中二选一，禁止空转。"
             "previous_completed_task_sops与active_skill只提供可复用方法，不能复用旧答案；复用前仍须用沙盒验证。"
+            "API请求禁止同时发送 X-API-Key 与 Authorization，也禁止同时发送 city 与 location。"
+            "若服务端提示缺少 Authorization 或 401，只改鉴权头为 Authorization；提示缺少 location 或 400 时将 city 映射为 location。"
+            "一旦某配置 HTTP 200 且数据完整，立即统计、规范化 types（去空白、去重、字典序）并提交；"
+            "禁止继续换鉴权头、换参数名、重复查询或无依据翻页。只有题目明确要求全部分页且响应含 next/has_more 才翻页。"
+            "提交失败只重交同一份规范化答案，不要重新请求业务接口。"
+            "文件修复只改任务指定路径：CRLF转LF、chmod +x、检查 shebang 与目录权限；不要 chmod 777。"
+            "检查脚本输出 Token 后立即提交；提交失败复用该 Token，不要重做修复。"
+            "共6个自进化任务，每个都必须单独领取并完成；完成当前任务后，冷却结束立即再领下一个。"
             "若服务端提示缺少请求头或参数，应修正后重试，不要把单次失败当作任务结束。"
             "脚本出现 bad interpreter、CRLF、缺执行权限或 shebang 无效时，应在任务目录内修复后重跑原命令。"
             "不要虚构 API Key/Token；日志和 sop 中不得出现完整凭据。"
