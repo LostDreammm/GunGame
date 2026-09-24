@@ -8,12 +8,12 @@
     "opening_cash_reserve": 0,
     "sell_value_threshold": 40,
     "sell_open_day": 2,
-    "stone_batch": 12,
+    "stone_batch": 14,
     "consumable_start_round": 391
   },
   "construction": {
     "mode": "auto",
-    "wall_target": 12,
+    "wall_target": 14,
     "adaptive_weapons": false,
     "weapon_plan": [
       "rocket",
@@ -24,8 +24,16 @@
   "tasks": {
     "solve_estimate": 6
   },
-  "offense": {
+  "market": {
     "enabled": true,
+    "lookahead_days": 2,
+    "max_hold_fraction": 0.5,
+    "stockpile_target": 16,
+    "scarcity_weight": 0.75,
+    "max_collection_weight": 3.0
+  },
+  "offense": {
+    "enabled": false,
     "start_day": 8,
     "enemy_base_health_threshold": 900
   }

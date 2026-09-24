@@ -351,13 +351,18 @@ class ProtocolIntegrationTests(unittest.TestCase):
     def test_reasoning_repairs_without_extra_llm_round(self):
         brain = Reasoning({"enable_llm": True, "enable_treasure": False})
         first = brain.update(task_snapshot(10, BEIJING_TASK), 1, "2")
-        self.assertTrue(first["prompt"])
-        self.assertFalse(first["executeCmd"])
+        self.assertTrue(first["executeCmd"])
+        self.assertFalse(first["prompt"])
+        explored = brain.update(task_snapshot(
+            11, BEIJING_TASK,
+            last="[TASK_FILE]/tmp/selfEvolutionTask/t1/task.md\n请查询北京天气\n"), 1, "2")
+        self.assertTrue(explored["prompt"])
+        self.assertFalse(explored["executeCmd"])
         llm = json.dumps({"kind": "command", "command": stale_docs_command("北京")}, ensure_ascii=False)
-        issued = brain.update(task_snapshot(11, BEIJING_TASK, llm=llm), 1, "2")
+        issued = brain.update(task_snapshot(12, BEIJING_TASK, llm=llm), 1, "2")
         self.assertIn("x-api-key", issued["executeCmd"])
         repaired = brain.update(task_snapshot(
-            12, BEIJING_TASK, last="[exitCode:1]\nMissing 'Authorization' header"), 1, "2")
+            13, BEIJING_TASK, last="[exitCode:1]\nMissing 'Authorization' header"), 1, "2")
         self.assertTrue(repaired["executeCmd"])
         self.assertFalse(repaired["prompt"])
         self.assertIn("Authorization", repaired["executeCmd"])
@@ -365,11 +370,11 @@ class ProtocolIntegrationTests(unittest.TestCase):
         trace = json.dumps(brain._trace, ensure_ascii=False)
         self.assertNotIn(SECRET, trace)
         mapped = brain.update(task_snapshot(
-            13, BEIJING_TASK, last="[exitCode:1]\nMissing required parameter: location"), 1, "2")
+            14, BEIJING_TASK, last="[exitCode:1]\nMissing required parameter: location"), 1, "2")
         self.assertIn("location=", mapped["executeCmd"])
         self.assertEqual(parse_http_command(mapped["executeCmd"])["params"].get("location"), "北京")
         done = brain.update(task_snapshot(
-            14, BEIJING_TASK,
+            15, BEIJING_TASK,
             last='[exitCode:0]\n{"weather":"晴","city":"北京","temp":20}'), 1, "2")
         self.assertTrue(done["taskAnswer"])
         self.assertIn("北京", done["taskAnswer"])
@@ -666,7 +671,7 @@ class EvolutionLoopTests(unittest.TestCase):
             lambda record, command: server(command or heritage_stale_command(extract_city(record["title"]))),
             lambda _ans: True, credential=SECRET,
         )
-        tokens = {"check1": "t1", "check2": "t2", "check3": "t3"}
+        tokens = {"check1": "token-check1", "check2": "token-check2", "check3": "token-check3"}
 
         def file_query(record, command):
             key = "check1" if "check1" in record["title"] else "check2" if "check2" in record["title"] else "check3"

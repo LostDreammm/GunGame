@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import RLock
@@ -29,6 +30,14 @@ def load_config() -> dict[str, Any]:
 _AGENT = Strategy(load_config())
 
 
+def parse_json_tolerant(raw: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        cleaned = re.sub(r",\s*([}\]])", r"\1", raw)
+        return json.loads(cleaned)
+
+
 def callback(payload: Any) -> dict[str, Any]:
     """Serialize access because the strategy keeps cross-round state."""
     with _LOCK:
@@ -48,7 +57,10 @@ def create_app() -> Any:
 
     @app.post("/")
     def process_request() -> Any:
-        payload = request.get_json()
+        try:
+            payload = parse_json_tolerant(request.get_data(as_text=True) or "")
+        except (ValueError, TypeError, json.JSONDecodeError):
+            payload = None
         if not isinstance(payload, dict):
             return jsonify({"error": "JSON object required"}), 400
         response = callback(payload)
@@ -68,7 +80,7 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length <= MAX_BODY:
                 self.send_error(413)
                 return
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = parse_json_tolerant(self.rfile.read(length).decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError
         except (ValueError, UnicodeError):

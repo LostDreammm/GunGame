@@ -56,8 +56,11 @@ PARAM_ALIASES = {"city": "location"}
 AUTH_HEADER_NAMES = ("authorization", "x-api-key", "api-key", "api_key", "token")
 CITY_PARAM_NAMES = ("location", "city")
 TOKEN_RE = re.compile(
-    r"(?i)(?:token|令牌|check[_-]?token)\s*[:=]\s*([A-Za-z0-9._\-+=/]{4,})"
+    r"(?im)^\s*(?:token|令牌|check[_-]?token)\s*[:=：]\s*([A-Za-z0-9._\-+=/]{6,})\s*$"
 )
+TOKEN_PLACEHOLDERS = frozenset({
+    "xxx", "xxxx", "token", "your_token", "your-token", "todo", "none",
+})
 SECRET_RE = re.compile(
     r"(?i)((?:authorization|x-api-key|api[-_]?key|token|cookie)\s*[:=]\s*(?:bearer\s+)?)"
     r"([^\s'\"\\]+)"
@@ -476,6 +479,10 @@ def buildApiAnswer(output, task=""):
     if obj is None:
         token = extractToken(output)
         return token or ""
+    if isinstance(obj, dict):
+        status = str(obj.get("status") or "").lower()
+        if status in {"error", "fail", "failed"} or obj.get("error"):
+            return ""
     records = _heritage_records(obj)
     payload = obj if isinstance(obj, dict) else {}
     types = normalizeTypes(_types_from_payload(payload, records))
@@ -503,18 +510,18 @@ def extractToken(output):
         return ""
     match = TOKEN_RE.search(body)
     if match:
-        return match.group(1).strip()
-    for line in reversed(body.splitlines()):
-        text = line.strip()
-        if text.startswith("[") or not text:
-            continue
-        if re.fullmatch(r"[A-Za-z0-9._\-+=/]{8,}", text):
-            return text
+        value = match.group(1).strip()
+        if value.lower() not in TOKEN_PLACEHOLDERS:
+            return value
     obj = _json_from_output(output)
     if isinstance(obj, dict):
+        status = str(obj.get("status") or obj.get("error") or "").lower()
+        if status in {"error", "fail", "failed"}:
+            return ""
         for key in ("token", "Token", "checkToken", "令牌"):
-            if obj.get(key):
-                return str(obj[key]).strip()
+            value = str(obj.get(key) or "").strip()
+            if value and value.lower() not in TOKEN_PLACEHOLDERS and len(value) >= 6:
+                return value
     return ""
 
 

@@ -9,18 +9,42 @@ import json
 import re
 
 
+from .market import grounded_closure
+from .task_engineering import check_answer, check_failure, repair_command
+from .task_learning import TaskLearning
 from .task_loop import (
     ANALYZING, ANSWER_READY, API_CATEGORY, COMPLETED, EXECUTING, FAILED_TERMINAL,
     FILE_CATEGORY, LEARNING, MAX_REQUEST_ATTEMPTS, RECEIVED, RETRYING, SUBMITTING,
+    TERMINAL_FAILED,
     VALIDATING, TaskLedger, advance_execution, apply_skill, buildApiRequest,
     buildRetryRequest, canonicalize_api_spec, classifyTaskKind, extract_check_path,
     extract_city, extract_credential, normalize_submission, parse_http_command,
     redact, resolveVerifiedApiContract, skill_text,
 )
+from .task_skills import (
+    SkillMemory, ambiguity_answers, parse_api_result, validate_result,
+)
+from .treasure_memory import TreasureMemory, prompt_schema as treasure_prompt_schema
 ORES = {"stone": ("石矿", "石头"), "iron": ("铁矿", "铁"), "copper": ("铜矿", "铜")}
 ITEM_ALIASES = {
     "AcientTablet": "古符石板", "StarSand": "星辰之沙", "FlameBreath": "烈焰之息",
     "FrostPotion": "寒霜药剂", "ThornAmulet": "荆棘护符", "IronWhistle": "回音铁哨",
+}
+NEGATIVE_EVENTS = ("停工", "塌方", "爆炸", "罢工", "检修", "事故", "封锁", "停产")
+RESUME_EVENTS = ("复产", "复工", "解禁", "恢复", "重新开采", "恢复开采", "重新运作")
+TREASURE_CATALOG = (
+    "AcientTablet", "StarSand", "FlameBreath", "FrostPotion", "ThornAmulet", "IronWhistle",
+)
+_LINE_TOKEN = re.compile(r"^\s*TOKEN\s*[=:：]\s*([A-Za-z0-9_\-]{6,})\s*$", re.M)
+_TOKEN_DUMMIES = {"xxx", "xxxx", "token", "your_token", "your-token", "todo", "none"}
+STOP_EVENTS = ("停工", "停产", "停采", "塌方", "检修", "事故", "封闭", "关闭", "抢修", "加固", "受损")
+CHINESE_DAYS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+DIRECTION_WORDS = {
+    "west": ("西", "左边", "左侧", "西侧", "西部"),
+    "east": ("东", "右边", "右侧", "东侧", "东部"),
+    "north": ("北", "上边", "上方", "北侧", "北部"),
+    "south": ("南", "下边", "下方", "南侧", "南部"),
 }
 
 
@@ -120,6 +144,16 @@ class Reasoning:
         self._task_family = "unknown"
         self._task_start_round = None
         self._task_timeout = None
+        self._task_discovered = False
+        self._task_probe_done = False
+        self._task_api_probe_done = False
+        self._task_llm_loops = 0
+        self._task_non_json = 0
+        self._task_workspace = ""
+        self._official_resolved = False
+        self._folk_log = []
+        self._sop_notes = {}
+        self._finished_tasks = 0
         self._pending = None
         self._trace = []
         self._lessons = {}
@@ -133,7 +167,83 @@ class Reasoning:
         self._active_skill = None
         self._treasure_finished = False
         self._rejected_treasures = set()
+        self.prices_history = {ore: [] for ore in ORES}
+        self.baselines = {}
+        self.forecasts = {}
+        self._forecast_seen = set()
+        self.treasure_positions = []
+        self.treasure_item_sets = []
+        self.treasure_open_day = None
+        self._pos_index = 0
+        self._item_index = 0
+        self._folk_text = ""
+        self._asked_treasure_day = None
         self.ledger = TaskLedger()
+        self.learning = TaskLearning()
+        self.skill_memory = SkillMemory()
+        self.treasure_memory = TreasureMemory()
+        self._task_context = None
+        self._skill_plan = None
+        self._skill_result = None
+        self._compiled_cmd = False
+
+    def export_knowledge(self):
+        return {
+            "news_history": list(self.news_history),
+            "skills": dict(self._skills),
+            "lessons": {key: list(value) for key, value in self._lessons.items()},
+            "prices_history": {key: list(value) for key, value in self.prices_history.items()},
+            "baselines": dict(self.baselines),
+            "forecasts": {key: dict(value) for key, value in self.forecasts.items()},
+            "treasure_positions": [dict(item) for item in self.treasure_positions],
+            "treasure_item_sets": [list(item) for item in self.treasure_item_sets],
+            "treasure_open_day": self.treasure_open_day,
+            "folk_text": self._folk_text,
+            "folk_log": list(self._folk_log),
+            "sop_notes": dict(self._sop_notes),
+            "finished_tasks": self._finished_tasks,
+            "task_learning": {
+                "records": {key: list(value) for key, value in self.learning.records.items()},
+                "durations": {key: list(value) for key, value in self.learning.durations.items()},
+                "failures": dict(self.learning.failures),
+            },
+            "skill_memory": self.skill_memory.snapshot(),
+            "treasure_memory": self.treasure_memory.to_dict(),
+        }
+
+    def import_knowledge(self, knowledge):
+        if not knowledge:
+            return
+        self.news_history = list(knowledge.get("news_history") or self.news_history)
+        self._skills = dict(knowledge.get("skills") or self._skills)
+        self._lessons = {key: list(value) for key, value in (knowledge.get("lessons") or self._lessons).items()}
+        history = knowledge.get("prices_history") or {}
+        for ore in ORES:
+            self.prices_history[ore] = list(history.get(ore) or self.prices_history.get(ore) or [])
+        self.baselines = dict(knowledge.get("baselines") or self.baselines)
+        self.forecasts = {key: dict(value) for key, value in (knowledge.get("forecasts") or self.forecasts).items()}
+        self.treasure_positions = [dict(item) for item in knowledge.get("treasure_positions") or []]
+        self.treasure_item_sets = [list(item) for item in knowledge.get("treasure_item_sets") or []]
+        self.treasure_open_day = knowledge.get("treasure_open_day", self.treasure_open_day)
+        self._folk_text = knowledge.get("folk_text") or self._folk_text
+        self._folk_log = list(knowledge.get("folk_log") or self._folk_log)
+        self._sop_notes = dict(knowledge.get("sop_notes") or getattr(self, "_sop_notes", {}))
+        self._finished_tasks = int(knowledge.get("finished_tasks") or self._finished_tasks or 0)
+        learned = knowledge.get("task_learning") or {}
+        self.learning.records = {key: list(value) for key, value in (learned.get("records") or {}).items()}
+        self.learning.durations = {key: list(value) for key, value in (learned.get("durations") or {}).items()}
+        self.learning.failures = dict(learned.get("failures") or {})
+        snap = knowledge.get("skill_memory") or {}
+        self.skill_memory = SkillMemory()
+        for recipe in snap.get("recipes") or []:
+            if isinstance(recipe, dict) and recipe.get("service") and recipe.get("response_schema"):
+                key = (recipe["service"], recipe.get("schema"), recipe["response_schema"])
+                self.skill_memory.recipes[key] = recipe
+        for source in snap.get("document_sources") or []:
+            if isinstance(source, dict) and source.get("service") and source.get("path"):
+                self.skill_memory._documents[(source["service"], source["path"])] = source
+        if knowledge.get("treasure_memory"):
+            self.treasure_memory = TreasureMemory.from_dict(knowledge["treasure_memory"])
 
     def update(self, data, day, pioneer_id):
         result = {"prompt": "", "executeCmd": "", "taskAnswer": None}
@@ -149,16 +259,15 @@ class Reasoning:
         self._record_news(data, day)
         self.blocked_ores = {entry["ore"] for entry in self._closures
                              if entry["start_day"] <= day <= entry["end_day"]}
-        if data.get("lastSummonTreasureResult") in (1, 4):
+        self._ingest_prices(data, day)
+        self._forecast_from_news(data, day)
+        self._rule_extract_treasure(data, day)
+        if data.get("lastSummonTreasureResult") in (1, 2, 3, 4):
             self._treasure_finished = True
-            self.treasure = None
-        elif data.get("lastSummonTreasureResult") in (2, 3):
-            # A legal failed probe consumes the offering. Do not repeat it.
-            if self.treasure:
-                self._rejected_treasures.add(self._treasure_key(self.treasure))
             self.treasure = None
         if self.treasure and current_round > self.treasure.get("close_round", 10 ** 9):
             self.treasure = None
+        self._refresh_treasure_view(current_round, day)
 
         task = data.get("phaseTask")
         task = task if isinstance(task, str) else ""
@@ -168,6 +277,16 @@ class Reasoning:
             self._task_family = self._family(data, pioneer_id)
             self._task_start_round = current_round if task else None
             self._task_timeout = self._timeout_for_family(data, self._task_family) if task else None
+            self._task_discovered = False
+            self._task_probe_done = False
+            self._task_api_probe_done = False
+            self._task_llm_loops = 0
+            self._task_non_json = 0
+            self._task_workspace = ""
+            self._task_context = None
+            self._skill_plan = None
+            self._skill_result = None
+            self._compiled_cmd = False
             self._trace = []
             self._attempts = []
             self._failed_fingerprints = set()
@@ -180,6 +299,7 @@ class Reasoning:
             self._pending = None
         if 1 in codes:
             self.ledger.fail_current(error="timeout")
+            self.learning.record_failure(self._task_family)
             self._task = ""
             self._pending = None
             self._trace = []
@@ -193,23 +313,59 @@ class Reasoning:
             return self._update_task(data, day, current_round, errors, result)
 
         pending = self._pending
-        if pending and pending["kind"] == "news" and current_round > pending["round"]:
-            decision = _json_object(data.get("llmResp"))
-            if not codes.intersection({3, 5}) and decision and decision.get("kind") == "news":
-                self._consume_news(decision, data, current_round)
+        if pending and pending["kind"] in {"news", "ore_hint", "cache_hint", "treasure_review"} and current_round > pending["round"]:
+            raw = data.get("llmResp")
+            decision = _json_object(raw)
+            if pending["kind"] == "cache_hint":
+                if not codes.intersection({3, 5}):
+                    self._apply_cache_hint(raw, data, current_round)
+                    self._ingest_treasure_hypothesis(decision, data)
+                else:
+                    self._last_news_prompt = None
+            elif pending["kind"] == "treasure_review":
+                if not codes.intersection({3, 5}) and decision:
+                    approved = self.treasure_memory.accept_review(
+                        decision, self.news_history, data, self.config.get("round_origin", 1))
+                    self._adopt_reviewed_treasure(approved)
+                else:
+                    self._last_news_prompt = None
             else:
-                # Retry a failed analysis using the remaining daily allowance.
-                # A valid empty analysis is an abstention, not a transport error.
-                self._last_news_prompt = None
+                if not codes.intersection({3, 5}) and decision:
+                    if decision.get("kind") == "news":
+                        self._consume_news(decision, data, current_round)
+                    else:
+                        self._apply_ore_hint(decision, day)
+                    self._ingest_treasure_hypothesis(decision, data)
+                else:
+                    self._last_news_prompt = None
             self._pending = None
             self.blocked_ores = {entry["ore"] for entry in self._closures
                                  if entry["start_day"] <= day <= entry["end_day"]}
+        origin = self.config.get("round_origin", 1)
+        self.treasure_memory.sync(self.news_history, data, origin)
+        self._adopt_reviewed_treasure(self.treasure_memory.candidate)
+        if (self.treasure_memory.pending_candidate and self.news_calls_today < 3
+                and not self._quota_blocked and not self._pending):
+            review = self.treasure_memory.review_prompt(data, origin)
+            if review:
+                result["prompt"] = review
+                self._pending = {"kind": "treasure_review", "round": current_round, "day": day}
+                self.news_calls_today += 1
+                return result
         if (self._last_news is not None and self._last_news != self._last_news_prompt
                 and self.news_calls_today < 3 and not self._quota_blocked and not self._pending):
-            result["prompt"] = self._news_prompt(data, day, current_round)
-            self._pending = {"kind": "news", "round": current_round, "day": day}
-            self._last_news_prompt = self._last_news
-            self.news_calls_today += 1
+            official_fresh = bool((self._last_news or ("", ""))[0]) and not self._official_resolved
+            folk_fresh = self._needs_treasure_guess()
+            if official_fresh:
+                result["prompt"] = self._ore_hint_prompt(data, day)
+                self._pending = {"kind": "ore_hint", "round": current_round, "day": day}
+                self._last_news_prompt = self._last_news
+                self.news_calls_today += 1
+            elif folk_fresh:
+                result["prompt"] = self._cache_hint_prompt()
+                self._pending = {"kind": "cache_hint", "round": current_round, "day": day}
+                self._last_news_prompt = self._last_news
+                self.news_calls_today += 1
         return result
 
     def _update_task(self, data, day, current_round, errors, result):
@@ -224,7 +380,9 @@ class Reasoning:
         if pending and pending["kind"] == "task_llm":
             raw_response = data.get("llmResp")
             decision = _json_object(raw_response)
+            self._task_llm_loops += 1
             if decision and decision.get("kind") == "command":
+                self._task_non_json = 0
                 if record and record.get("query_done") and record.get("answer"):
                     return self._submit_prepared(record["answer"], day, current_round, result)
                 command = decision.get("command")
@@ -235,15 +393,50 @@ class Reasoning:
             if not answer:
                 answer, sop = _plain_task_answer(raw_response), ""
             if answer and len(answer) <= 65536:
+                self._task_non_json = 0
                 answer = normalize_submission(answer, self._task)
                 return self._submit_prepared(answer, day, current_round, result, sop=sop)
+            self._task_non_json += 1
             self._append_trace({"issue": "LLM未返回可用的严格JSON；请按指定格式纠正。",
                                 "response_excerpt": str(data.get("llmResp", ""))[:3000]})
+        elif pending and pending["kind"] == "task_discovery":
+            output = data.get("lastCmdResult") or "[NO_RESULT] 平台未返回探索结果。"
+            self._task_discovered = True
+            self._ingest_discovery(output)
+            self._append_trace({"discovery": str(output)[:24000]})
+            token = self._line_token(output)
+            if token:
+                return self._submit_prepared(
+                    json.dumps({"token": token}, ensure_ascii=False),
+                    day, current_round, result)
+            specialized = self._try_specialized_solver(day, current_round, result)
+            if specialized:
+                return result
+            if (not self._task_probe_done and re.search(
+                    r"(?:^|/)(?:ws_[^/\s]+/)?check(?:\s|$)", str(output), flags=re.M)):
+                self._task_probe_done = True
+                probe = self._task_probe_command(output)
+                if probe:
+                    return self._emit_command(probe, day, current_round, result)
+            if (not self._task_api_probe_done and self._looks_like_http_task(output)):
+                self._task_api_probe_done = True
+                probe = self._http_matrix_command(output)
+                if probe:
+                    return self._emit_command(probe, day, current_round, result)
         elif pending and pending["kind"] == "task_cmd":
             if record and record.get("query_done") and record.get("answer"):
                 return self._submit_prepared(record["answer"], day, current_round, result)
             output = data.get("lastCmdResult") or "[NO_RESULT] 平台本轮未提供上次命令输出，不能假定成功。"
+            self._note_workspace(output)
             self._append_trace({"command": pending["command"], "result": str(output)[:24000]})
+            compiled = self._take_compiled_result(output, day, current_round, result)
+            if compiled:
+                return result
+            token = self._line_token(output)
+            if token:
+                return self._submit_prepared(
+                    json.dumps({"token": token}, ensure_ascii=False),
+                    day, current_round, result)
             if self._follow_sandbox_output(pending["command"], output, data, day, current_round, result):
                 return result
         elif pending and pending["kind"] == "task_answer":
@@ -263,10 +456,234 @@ class Reasoning:
             return self._submit_prepared(record["answer"], day, current_round, result)
         if self._task_state == RECEIVED and self._reuse_skill_command(day, current_round, result):
             return result
+        if not self._task_discovered:
+            result["executeCmd"] = self._task_discovery_command()
+            self._pending = {"kind": "task_discovery", "round": current_round, "day": day,
+                             "command": result["executeCmd"]}
+            return result
+        loop_limit = max(2, min(8, (self._task_timeout or 10) - 2))
+        if self._task_non_json >= 3 or self._task_llm_loops >= loop_limit:
+            self._task_state = FAILED_TERMINAL
+            self.ledger.fail_current(state=TERMINAL_FAILED, error="task_llm_limit")
+            return result
         self._task_state = ANALYZING
         result["prompt"] = self._task_prompt(data)
         self._pending = {"kind": "task_llm", "round": current_round, "day": day}
         return result
+
+    def _task_discovery_command(self):
+        """One bounded sandbox pass: locate the task and read its local references."""
+        return (
+            "root=/tmp/selfEvolutionTask; "
+            "f=$(find \"$root\" -maxdepth 8 -type f "
+            "\\( -iname 'task*.md' -o -iname '任务*.md' \\) -print -quit 2>/dev/null); "
+            "[ -n \"$f\" ] || { echo '[DISCOVERY] task file not found'; exit 0; }; "
+            "d=$(dirname \"$f\"); echo \"[TASK_FILE]$f\"; cat \"$f\"; "
+            "for p in \"$d/README.md\" \"$d/API_DOCS.md\" \"$d/spec.md\" "
+            "\"$d\"/ws_*/README.md \"$d\"/ws_*/API_DOCS.md \"$d\"/ws_*/spec.md; do "
+            "[ -f \"$p\" ] && { echo \"[REFERENCE]$p\"; cat \"$p\"; }; done; "
+            "echo '[FILES]'; find \"$d\" -maxdepth 3 -type f -printf '%p %m\\n' 2>/dev/null"
+        )
+
+    @staticmethod
+    def _task_probe_command(discovery):
+        """Run a discovered checker after normalizing only that workspace."""
+        paths = re.findall(r"(/[^\s]+/check)\s+[0-7]{3,4}", str(discovery))
+        path = paths[0] if paths else ""
+        if not path:
+            return ""
+        directory = path.rsplit("/", 1)[0]
+        return (
+            "cd %s && python3 -c %s && chmod u+x ./check && ./check"
+            % (json.dumps(directory), json.dumps(
+                "from pathlib import Path; p=Path('check'); "
+                "b=p.read_bytes(); p.write_bytes(b.replace(b'\\r\\n', b'\\n').replace(b'\\r', b'\\n'))"
+            ))
+        )
+
+    def _note_workspace(self, output):
+        text = str(output or "")
+        marker = re.search(r"\[TASK_FILE\](\S+)", text)
+        if marker:
+            self._task_workspace = marker.group(1).rsplit("/", 1)[0]
+            return
+        listed = re.search(r"(/[^\s]+)/(?:README|API_DOCS|spec)\.md", text)
+        if listed:
+            self._task_workspace = listed.group(1)
+
+    @staticmethod
+    def _sandbox_envelope(output):
+        text = str(output or "")
+        if text.startswith("[exitCode:"):
+            return text
+        return "[exitCode:0]\n" + text
+
+    def _ingest_discovery(self, output):
+        self._note_workspace(output)
+        text = str(output or "")
+        task_path = ""
+        marker = re.search(r"\[TASK_FILE\](\S+)", text)
+        if marker:
+            task_path = marker.group(1)
+        task_doc = ""
+        if task_path:
+            after = text.split("[TASK_FILE]" + task_path, 1)[-1]
+            task_doc = re.split(r"\[REFERENCE\]|\[FILES\]", after, maxsplit=1)[0]
+        refs = []
+        for match in re.finditer(r"\[REFERENCE\](\S+)\n(.*?)(?=\[REFERENCE\]|\[FILES\]|\Z)", text, flags=re.S):
+            refs.append({"path": match.group(1), "content": match.group(2),
+                         "truncated": False, "error": None})
+        spec, spec_path = "", ""
+        for ref in refs:
+            if str(ref["path"]).endswith("spec.md"):
+                spec, spec_path = ref["content"], ref["path"]
+                break
+        workspace = self._task_workspace
+        if spec_path:
+            workspace = spec_path.rsplit("/", 1)[0]
+            self._task_workspace = workspace
+        self._task_context = {
+            "status": "ok",
+            "workspace": workspace,
+            "task_document": ((self._task or "") + "\n" + task_doc)[:50000],
+            "task_path": task_path,
+            "spec": spec,
+            "spec_path": spec_path,
+            "referenced_documents": refs,
+            "truncated": {},
+        }
+
+    def _try_specialized_solver(self, day, current_round, result):
+        context = self._task_context
+        if not isinstance(context, dict):
+            return False
+        command = repair_command(context)
+        if command:
+            self._task_probe_done = True
+            self._emit_command(command, day, current_round, result, compiled=True)
+            return True
+        plan = self.skill_memory.propose(context)
+        if plan and plan.get("command"):
+            self._skill_plan = plan
+            self._task_api_probe_done = True
+            self._emit_command(plan["command"], day, current_round, result, compiled=True)
+            return True
+        return False
+
+    def _take_compiled_result(self, output, day, current_round, result):
+        envelope = self._sandbox_envelope(output)
+        workspace = (self._task_workspace or "").strip()
+        if workspace:
+            answer = check_answer(envelope, workspace)
+            if answer:
+                return self._submit_prepared(
+                    answer.get("answer"), day, current_round, result, sop=answer.get("sop") or "")
+            if check_failure(envelope, workspace):
+                self._append_trace({"issue": "compiled_check_failed",
+                                    "detail": check_failure(envelope, workspace)})
+        if self._skill_plan:
+            parsed = parse_api_result(envelope)
+            if parsed.get("ok") and validate_result(self._skill_plan, parsed):
+                self._skill_result = parsed
+                return self._submit_prepared(
+                    json.dumps(parsed.get("answer"), ensure_ascii=False),
+                    day, current_round, result)
+            if parsed.get("error") == "ambiguous_earliest_era":
+                options = ambiguity_answers(self._skill_plan, parsed)
+                if options:
+                    return self._submit_prepared(
+                        json.dumps(options[0], ensure_ascii=False), day, current_round, result)
+        return None
+
+    def _ingest_treasure_hypothesis(self, decision, data):
+        if not isinstance(decision, dict) or not self.config.get("enable_treasure", True):
+            return
+        raw = decision.get("treasure_hypothesis") or decision.get("hypothesis")
+        if not isinstance(raw, dict):
+            return
+        origin = self.config.get("round_origin", 1)
+        self.treasure_memory.propose(raw, self.news_history, data, origin)
+
+    def _adopt_reviewed_treasure(self, approved):
+        if not approved or self._treasure_finished:
+            return
+        origin = self.config.get("round_origin", 1)
+        candidate = {
+            "pos": dict(approved["pos"]),
+            "items": list(approved["items"]),
+            "open_round": approved["open_round"],
+            "close_round": approved.get("close_round", origin + 1299),
+            "ready": True,
+        }
+        if self._treasure_key(candidate) in self._rejected_treasures:
+            return
+        self.treasure = candidate
+
+    def _bind_workspace(self, command):
+        text = (command or "").strip()
+        root = (self._task_workspace or "").strip()
+        if not text or not root:
+            return text
+        if text.startswith("/") or re.search(r"(^|&&|;|\|)\s*cd\s", text):
+            return text
+        return "cd %s && %s" % (json.dumps(root), text)
+
+    @staticmethod
+    def _line_token(output):
+        match = _LINE_TOKEN.search(str(output or ""))
+        if not match:
+            return ""
+        value = match.group(1).strip()
+        if value.lower() in _TOKEN_DUMMIES:
+            return ""
+        return value
+
+    def _looks_like_http_task(self, output):
+        text = str(output or "") + "\n" + (self._task or "")
+        return bool(re.search(r"http://localhost:\d+|/api/", text, flags=re.I))
+
+    def _http_matrix_command(self, output):
+        """Deterministic auth x parameter x city sweep; lock the first HTTP 200."""
+        city = extract_city(self._task) or ""
+        text = str(output or "")
+        url = ""
+        found = re.search(r"(https?://127\.0\.0\.1:\d+/[A-Za-z0-9_./\-]+)", text)
+        if found:
+            url = found.group(1)
+        else:
+            found = re.search(r"(https?://localhost:\d+/[A-Za-z0-9_./\-]+)", text)
+            url = found.group(1) if found else "http://127.0.0.1:8899/api"
+        key = extract_credential({"headers": {}, "url": ""}) or ""
+        secret = re.search(r"(?:Authorization|x-api-key|api[_-]?key)\s*[:=]\s*([A-Za-z0-9._\-+=/]{6,})",
+                           text, flags=re.I)
+        if secret:
+            key = secret.group(1)
+        root = json.dumps(self._task_workspace or ".")
+        return (
+            "python3 - <<'PY'\n"
+            "import json,urllib.error,urllib.parse,urllib.request\n"
+            "base=%r; city=%r; key=%r; root=%s\n"
+            "headers_list=[('Authorization','Bearer '+key),('x-api-key',key)] if key else [('Authorization','')]\n"
+            "params=['location','city']\n"
+            "hit=None\n"
+            "for hname,hval in headers_list:\n"
+            "    for pname in params:\n"
+            "        q=urllib.parse.urlencode({pname:city} if city else {})\n"
+            "        req=urllib.request.Request(base+('?'+q if q else ''), headers={hname:hval} if hval else {})\n"
+            "        try:\n"
+            "            with urllib.request.urlopen(req, timeout=8) as resp:\n"
+            "                body=resp.read().decode('utf-8','replace')\n"
+            "                if resp.status==200 and 'error' not in body.lower()[:80]:\n"
+            "                    hit={'status':200,'header':hname,'param':pname,'body':body[:2000]}\n"
+            "                    break\n"
+            "        except Exception as exc:\n"
+            "            print('TRY',hname,pname,type(exc).__name__)\n"
+            "            continue\n"
+            "    if hit: break\n"
+            "print('FACT',json.dumps(hit or {'status':'none'},ensure_ascii=False))\n"
+            "PY"
+            % (url, city, key, root)
+        )
 
     def _submit_prepared(self, answer, day, current_round, result, sop=""):
         answer = normalize_submission(answer, self._task)
@@ -274,6 +691,7 @@ class Reasoning:
             return result
         result["taskAnswer"] = answer
         self.ledger.store_answer(answer, query_done=True)
+        self._remember_recipe(answer, sop)
         record = self.ledger.current()
         if record:
             record["state"] = SUBMITTING
@@ -282,7 +700,21 @@ class Reasoning:
                          "answer": answer, "sop": (sop or skill_text(self._active_skill))[:4000]}
         return result
 
-    def _emit_command(self, command, day, current_round, result):
+    def _remember_recipe(self, answer, sop=""):
+        key = self._task_family or "unknown"
+        if key in self._sop_notes or self._finished_tasks >= 2:
+            return
+        cmds = [entry.get("command") for entry in self._trace if isinstance(entry, dict) and entry.get("command")]
+        note = (sop or "").strip() or (
+            "题目摘录：%s\n命令：%s\n答案形态：%s"
+            % ((self._task or "")[:180], " ; ".join(str(item)[:80] for item in cmds[-4:]), str(answer)[:200])
+        )
+        self._sop_notes[key] = note[:1500]
+
+    def _emit_command(self, command, day, current_round, result, compiled=False):
+        if not compiled:
+            command = self._bind_workspace(command)
+        self._compiled_cmd = bool(compiled)
         spec = parse_http_command(command)
         if spec:
             contract = resolveVerifiedApiContract(self.ledger.verified_api or self._active_skill)
@@ -471,7 +903,8 @@ class Reasoning:
 
     def task_familiarity(self, family):
         """Number of verified SOPs available to the scheduler."""
-        return len(self._lessons.get(str(family), []))
+        learned = len(self.learning.records.get(str(family), []))
+        return learned or len(self._lessons.get(str(family), []))
 
     def _save_completed_lesson(self, data, codes, pioneer_id, next_task):
         pending = self._pending
@@ -489,13 +922,23 @@ class Reasoning:
         alive = any(str(role.get("id")) == str(pioneer_id) and role.get("health", 0) > 0
                     for role in (data.get("teamOur") or {}).get("roles", []))
         if alive:
+            self._finished_tasks += 1
+            elapsed = 1
+            if self._task_start_round is not None:
+                elapsed = max(1, int(data.get("roundNo", 0)) - self._task_start_round)
+            lesson = self.learning.learn(
+                self._task_family, pending.get("sop") or skill_text(self._active_skill),
+                pending.get("answer") or "", self._trace, elapsed)
+            if lesson:
+                self._sop_notes[self._task_family] = lesson[:1500]
             lessons = self._lessons.setdefault(self._task_family, [])
-            lesson = pending.get("sop") or skill_text(self._active_skill)
             if lesson and lesson not in lessons:
                 lessons.append(lesson)
                 del lessons[:-4]
             while len(self._lessons) > 8:
                 self._lessons.pop(next(iter(self._lessons)))
+            if self._skill_plan and self._skill_result:
+                self.skill_memory.learn(self._skill_plan, self._skill_result, confirmed=True)
 
     @staticmethod
     def _format_hint(task):
@@ -516,6 +959,8 @@ class Reasoning:
                    "task_state": self._task_state,
                    "answer_format_hint": self._format_hint(self._task),
                    "previous_completed_task_sops": self._lessons.get(self._task_family, []),
+                   "family_recipe": self._sop_notes.get(self._task_family, ""),
+                   "workspace": self._task_workspace,
                    "active_skill": json.loads(skill_text(self._active_skill) or "null") if self._active_skill else None,
                    "recent_trace": self._trace,
                    "repair_attempts": self._repair_tries,
@@ -556,6 +1001,171 @@ class Reasoning:
             "\n资料JSON：" + _dump(context)
         )
 
+    def predicted_price(self, ore, current, day):
+        forecast = self.forecasts.get(ore)
+        if (forecast and forecast.get("start", day) <= day
+                and day <= forecast.get("until", -1)):
+            return float(forecast.get("price", current) or current)
+        return float(current or 0)
+
+    def should_stockpile(self, ore, day):
+        forecast = self.forecasts.get(ore)
+        return bool(forecast and day < forecast.get("start", day))
+
+    def sale_boost(self, ore, day):
+        forecast = self.forecasts.get(ore)
+        if not forecast:
+            return 0.0
+        if forecast.get("start", day) <= day <= forecast.get("until", -1):
+            return 50.0
+        return 0.0
+
+    def is_spiking(self, ore, current, day, ratio=1.2):
+        baseline = float(self.baselines.get(ore, current) or current or 0)
+        if baseline <= 0:
+            return False
+        return self.predicted_price(ore, current, day) > baseline * ratio
+
+    def _ingest_prices(self, data, day):
+        for item in data.get("vendorShopList") or []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if name not in ORES or "price" not in item:
+                continue
+            price = max(0, int(item["price"]))
+            history = self.prices_history.setdefault(name, [])
+            if not history or history[-1] != (day, price):
+                history.append((day, price))
+            self.baselines[name] = price
+            del history[:-16]
+
+    def _hist_rise_mean(self, ore):
+        history = [price for _, price in self.prices_history.get(ore, []) if price > 0]
+        rises = []
+        for previous, current in zip(history, history[1:]):
+            if previous > 0 and current > previous:
+                rises.append(current / previous)
+        if not rises:
+            return 1.6
+        return sum(rises) / len(rises)
+
+    def _forecast_from_news(self, data, day):
+        news = data.get("worldNews") or {}
+        text = news.get("officialNews") or ""
+        if not isinstance(text, str) or not text.strip():
+            return
+        signature = text.strip()
+        if signature in self._forecast_seen:
+            return
+        self._forecast_seen.add(signature)
+        duration = re.search(r"(10|[1-9]|[一二两三四五六七八九十])\s*天", text)
+        raw_days = duration.group(1) if duration else None
+        days = int(raw_days) if raw_days and raw_days.isdigit() else CHINESE_DAYS.get(raw_days, 2)
+        for ore, aliases in ORES.items():
+            mentioned = ore in text or any(alias in text for alias in aliases)
+            if not mentioned:
+                continue
+            baseline = self.baselines.get(ore, 0)
+            if any(word in text for word in RESUME_EVENTS):
+                self.forecasts.pop(ore, None)
+                self._official_resolved = True
+            elif any(word in text for word in STOP_EVENTS):
+                self.forecasts[ore] = {
+                    "price": baseline * self._hist_rise_mean(ore),
+                    "start": day + 1,
+                    "until": day + max(1, days),
+                }
+                self._official_resolved = True
+
+    def _guess_edge_point(self, data, side):
+        info = data.get("mapInfo") or {}
+        width, height = int(info.get("width", 41)), int(info.get("height", 32))
+        base = next((role for role in (data.get("teamOur") or {}).get("roles", [])
+                     if role.get("roleType") == "station"), None)
+        if base:
+            cx, cy = int(base["pos"]["x"]) + 0.5, int(base["pos"]["y"]) - 0.5
+        else:
+            cx, cy = width / 2.0, height / 2.0
+        if side == "west":
+            return {"x": 2, "y": max(1, min(height - 2, int(cy)))}
+        if side == "east":
+            return {"x": width - 3, "y": max(1, min(height - 2, int(cy)))}
+        if side == "north":
+            return {"x": max(1, min(width - 2, int(cx))), "y": height - 3}
+        return {"x": max(1, min(width - 2, int(cx))), "y": 2}
+
+    def _rule_extract_treasure(self, data, day):
+        news = data.get("worldNews") or {}
+        folk = news.get("folkLegends") or ""
+        if not isinstance(folk, str) or not folk.strip():
+            return
+        if folk not in self._folk_text:
+            self._folk_text = (self._folk_text + "\n" + folk).strip()
+        text = self._folk_text
+        found_coord = False
+        for match in re.finditer(r"[（(]\s*(\d+)\s*[,，]\s*(\d+)\s*[)）]", text):
+            point = {"x": int(match.group(1)), "y": int(match.group(2))}
+            found_coord = True
+            if point not in self.treasure_positions:
+                self.treasure_positions.insert(0, point)
+        # Direction-only clues remain context for the LLM; they are not precise
+        # enough to authorize a consumptive summon.
+        named = []
+        for ident, alias in ITEM_ALIASES.items():
+            if ident in text or alias in text:
+                named.append(ident)
+        limit = 3 if ("三钥" in text or "三件" in text) else (2 if ("两钥" in text or "两件" in text) else 0)
+        if named:
+            bundle = named[:limit] if limit else named
+            if bundle not in self.treasure_item_sets:
+                self.treasure_item_sets.insert(0, bundle)
+        match = re.search(r"第\s*([1-9]|10)\s*天", text)
+        if match:
+            self.treasure_open_day = int(match.group(1))
+
+    def _refresh_treasure_view(self, current_round, day):
+        if self._treasure_finished or not self.config.get("enable_treasure", True):
+            return
+        if self.treasure:
+            return
+        positions = self.treasure_positions or []
+        items = self.treasure_item_sets[self._item_index] if self.treasure_item_sets else []
+        if not positions or not items:
+            return
+        index = min(self._pos_index, len(positions) - 1)
+        origin = self.config.get("round_origin", 1)
+        if self.treasure_open_day is None:
+            return
+        open_day = self.treasure_open_day
+        opening = origin + (open_day - 1) * 130
+        self.treasure = {
+            "pos": dict(positions[index]),
+            "items": list(items),
+            "open_round": opening,
+            "close_round": origin + 1299,
+            "ready": False,
+        }
+
+    def _rotate_treasure_position(self, day, current_round):
+        if self.treasure:
+            self._rejected_treasures.add(self._treasure_key(self.treasure))
+        if len(self.treasure_positions) <= 1:
+            self.treasure_open_day = (self.treasure_open_day or day) + 1
+        else:
+            self._pos_index = (self._pos_index + 1) % len(self.treasure_positions)
+        self.treasure = None
+        self._refresh_treasure_view(current_round, day)
+
+    def _rotate_treasure_items(self):
+        if self.treasure:
+            self._rejected_treasures.add(self._treasure_key(self.treasure))
+        if self.treasure_item_sets:
+            self._item_index = (self._item_index + 1) % len(self.treasure_item_sets)
+        self.treasure = None
+        if self._day is not None:
+            self._refresh_treasure_view(0, self._day)
+
     def _record_news(self, data, day):
         news = data.get("worldNews") or {}
         official = news.get("officialNews") or ""
@@ -571,6 +1181,10 @@ class Reasoning:
             new_official = official if official != previous[0] else ""
             new_folk = folk if folk != previous[1] else ""
             self.news_history.append({"day": day, "officialNews": new_official, "folkLegends": new_folk})
+            if new_folk and new_folk.strip() and new_folk.strip() not in self._folk_log:
+                self._folk_log.append(new_folk.strip())
+            if new_official:
+                self._official_resolved = False
             self._literal_closures(new_official, day)
         self.news_history = [entry for entry in self.news_history if entry["day"] >= day - 9][-40:]
         self._closures = [entry for entry in self._closures if entry["end_day"] >= day][-40:]
@@ -586,10 +1200,24 @@ class Reasoning:
         for ore, aliases in ORES.items():
             if not any(alias in text for alias in aliases[:1]) and ore not in text:
                 continue
+            if any(word in text for word in RESUME_EVENTS):
+                self._closures = [entry for entry in self._closures if entry["ore"] != ore]
+                self.forecasts.pop(ore, None)
+                self._official_resolved = True
+                continue
             if re.search(r"(?:明日|明天).{0,15}(?:全面)?停工", text) and "修复" in text:
-                duration = re.search(r"(?:需要|需|持续)\s*([1-9]|10)\s*天", text)
+                duration = re.search(
+                    r"(?:需要|需|持续)\s*(10|[1-9]|[一二两三四五六七八九十])\s*天", text)
                 if duration:
-                    self._add_closure(ore, published_day + 1, published_day + int(duration.group(1)))
+                    raw = duration.group(1)
+                    days = int(raw) if raw.isdigit() else CHINESE_DAYS.get(raw, 2)
+                    self._add_closure(ore, published_day + 1, published_day + days)
+            elif any(word in text for word in STOP_EVENTS):
+                duration = re.search(r"(10|[1-9]|[一二两三四五六七八九十])\s*天", text)
+                raw = duration.group(1) if duration else None
+                days = int(raw) if raw and raw.isdigit() else CHINESE_DAYS.get(raw, 2)
+                self._add_closure(ore, published_day + 1, published_day + days)
+                self._official_resolved = True
             exact = re.search(r"第\s*(\d+)\s*天\s*(?:至|到|—|-)\s*第?\s*(\d+)\s*天.{0,25}(?:停工|停采|禁止采集)", text)
             if exact:
                 self._add_closure(ore, int(exact.group(1)), int(exact.group(2)))
@@ -599,6 +1227,108 @@ class Reasoning:
             entry = {"ore": ore, "start_day": first, "end_day": last}
             if entry not in self._closures:
                 self._closures.append(entry)
+
+    def _needs_treasure_guess(self):
+        if self._treasure_finished or not self.config.get("enable_treasure", True):
+            return False
+        if self.treasure and self.treasure.get("ready"):
+            return False
+        return bool(self._folk_log or self._folk_text)
+
+    def _ore_hint_prompt(self, data, day):
+        official = ((data.get("worldNews") or {}).get("officialNews") or "")[:800]
+        return (
+            "下面是一条官方矿区通报，请判断它对铜/铁/石的可采性和售价窗口。"
+            "只回一个JSON对象，不要解释：\n"
+            '{"ore":"copper|iron|stone","action":"halt|resume","from_day":%d,"span":<持续天数>}。'
+            "halt=停采并看涨；resume=恢复默认。不确定时 span 用 2。\n通报：%s"
+            % (day + 1, official)
+        )
+
+    def _apply_ore_hint(self, obj, day):
+        if not isinstance(obj, dict):
+            return False
+        name = str(obj.get("ore") or "").strip().lower()
+        ore = None
+        for key, aliases in ORES.items():
+            if name == key or name in aliases or name in {alias[:1] for alias in aliases}:
+                ore = key
+                break
+        if name in ("铜", "铁", "石"):
+            ore = {"铜": "copper", "铁": "iron", "石": "stone"}[name]
+        if ore not in ORES:
+            return False
+        action = str(obj.get("action") or obj.get("kind") or "").strip().lower()
+        if action in ("resume", "recover", "restore", "复工", "恢复"):
+            self.forecasts.pop(ore, None)
+            self._closures = [entry for entry in self._closures if entry["ore"] != ore]
+            self._official_resolved = True
+            return True
+        if action in ("halt", "stop", "rise", "停工", "停采", "涨价"):
+            try:
+                start = int(obj.get("from_day") or obj.get("start_day") or (day + 1))
+                span = int(obj.get("span") or obj.get("days") or 2)
+            except (TypeError, ValueError):
+                start, span = day + 1, 2
+            span = max(1, min(10, span))
+            baseline = self.baselines.get(ore, 0)
+            self.forecasts[ore] = {
+                "price": baseline * self._hist_rise_mean(ore),
+                "start": start,
+                "until": start + span - 1,
+            }
+            self._add_closure(ore, start, start + span - 1)
+            self._official_resolved = True
+            return True
+        return False
+
+    def _cache_hint_prompt(self):
+        clues = self._folk_log[-12:] or ([self._folk_text] if self._folk_text else [])
+        return (
+            "根据逐日累积的民间传闻，推断祭坛是否已经可以行动。"
+            "只回JSON：{\"x\":<int>,\"y\":<int>,\"items\":[\"StarSand\"],\"day\":<int>,\"ready\":<bool>}。"
+            "用品名必须落在 %s。线索不够时 ready=false，不要编造坐标。\n传闻：\n%s"
+            % (", ".join(TREASURE_CATALOG), "\n".join(clues))
+        )
+
+    def _apply_cache_hint(self, raw, data, current_round):
+        obj = _json_object(raw)
+        if not obj and isinstance(raw, str):
+            match = re.search(r"\{.*\}", raw, flags=re.S)
+            if match:
+                obj = _json_object(match.group(0))
+        if not isinstance(obj, dict):
+            return False
+        try:
+            x, y = int(obj.get("x")), int(obj.get("y"))
+        except (TypeError, ValueError):
+            return False
+        size = data.get("mapInfo") or {}
+        if not 0 <= x < int(size.get("width") or 0) or not 0 <= y < int(size.get("height") or 0):
+            return False
+        items = [str(item) for item in (obj.get("items") or []) if str(item) in TREASURE_CATALOG]
+        if len(items) != len(set(items)):
+            return False
+        try:
+            open_day = int(obj.get("day") or 0)
+        except (TypeError, ValueError):
+            open_day = 0
+        ready = bool(obj.get("ready")) and bool(items)
+        if not ready:
+            return False
+        origin = self.config.get("round_origin", 1)
+        opening = origin + max(0, open_day - 1) * 130 if open_day else origin
+        candidate = {
+            "pos": {"x": x, "y": y},
+            "items": items,
+            "open_round": opening,
+            "close_round": origin + 1299,
+            "ready": True,
+        }
+        if self._treasure_key(candidate) in self._rejected_treasures:
+            return False
+        self.treasure = candidate
+        return True
 
     def _news_prompt(self, data, day, current_round):
         shop = [entry.get("name") for entry in data.get("weaponShopList", []) if isinstance(entry, dict)]
@@ -622,7 +1352,9 @@ class Reasoning:
             "close_round仅在有明确关闭时间证据时填写。只引用资料中的逐字连续片段。"
             "原文直接给出答案时逐字核对；隐喻或跨日线索只有在三类条件都能唯一推出时才返回treasure，"
             "并在derivation中写出可复核推导。存在多个候选或缺少排他条件时返回null。"
-            "分析时逐日核对地点、祭品、时间三类约束及相互排除关系；不得输出command或answer。\n资料JSON：" + _dump(context)
+            "分析时逐日核对地点、祭品、时间三类约束及相互排除关系；不得输出command或answer。\n"
+            + treasure_prompt_schema() +
+            "\n资料JSON：" + _dump(context)
         )
 
     def _consume_news(self, decision, data, current_round):
@@ -635,7 +1367,9 @@ class Reasoning:
                 continue
             ore = closure.get("ore")
             evidence = closure.get("evidence")
-            if (ore in ORES and isinstance(evidence, str) and len(evidence) >= 8 and evidence in official
+            if grounded_closure(closure, self.news_history):
+                self._add_closure(ore, closure.get("start_day"), closure.get("end_day"))
+            elif (ore in ORES and isinstance(evidence, str) and len(evidence) >= 8 and evidence in official
                     and (ore in evidence or any(alias in evidence for alias in ORES[ore][:1]))
                     and any(term in evidence for term in ("停工", "停采", "无法采集", "禁止采集"))):
                 self._add_closure(ore, closure.get("start_day"), closure.get("end_day"))
@@ -707,7 +1441,7 @@ class Reasoning:
                 return None
         treasure = {"pos": dict(pos), "items": list(items), "open_round": opening,
                     "evidence": {"location": location, "items": recipe, "time": timing},
-                    "derivation": derivation}
+                    "derivation": derivation, "ready": True}
         if closing is not None:
             treasure["close_round"] = closing
         return treasure
